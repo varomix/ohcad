@@ -1,0 +1,31 @@
+# Odin build artifacts
+*.o
+*.obj
+*.so
+*.dll
+*.a
+*.lib
+*.wasm
+
+# Executables
+build/
+bin/
+obj/
+
+# macOS
+.DS_Store
+
+# Editor/IDE specific
+.vscode/
+.idea/
+
+# Temporary files
+*~
+*.bak
+*.swp
+
+# Sketch backup
+sketch copy.json
+
+# Documentation
+docs/
