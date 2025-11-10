@@ -1,11 +1,29 @@
+Week 9.5
 - viewport aspect ratio needs to be fixed/calculated
 - we need multi-touch, should we switch to sdl3?
 - 2 finger drag should orbit camera
 - 2 finger pinch should zoom camera
 - 2 finger drag + shift should pan camera
+
+
+Week 9.6
 - implement UI framework to create application GUI
-- S to pop tools menu
+- Create simple toolbar with buttons for tools
+
+Week 12.5
+- S (shortcut) to pop tools menu
 - tools menu should have search input to find tools
 - tools menu can house favorite tools/customizable
 - tools menu has a way to search for tools, click on a button, pop secondary popup with categories to find the tool you need.
 - radial menus for tools, example, radial menu for solid tools, radial menu for surface tools, radial menu for sketch tools, etc. shortcut should pop the radial menu for the current mode you are working on.
+- highlight on hover points and edges
+- shade close shapes
+- line tool should not continue a line after closing a shape
+
+
+MISC notes
+- remove viewer_sdl3.odin file, we are using the gpu version now
+- fix thick line issue when thick line is very close to camera
+- msaa / antialiasing
+- ✅ constraint icons
+- update viewport while scaling window

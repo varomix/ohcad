@@ -26,3 +26,5 @@ obj/
 
 # Sketch backup
 sketch copy.json
+
+COMMIT_MESSAGE.txt

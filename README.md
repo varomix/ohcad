@@ -4,9 +4,19 @@ A focused Part-Design style CAD kernel and 2D technical drawing system implement
 
 ## Project Status
 
-🚧 **Early Development - Week 1** 🚧
+🎉 **Week 9.5 Complete - SDL3 GPU Migration!** 🎉
 
-Currently implementing the foundational architecture. See [Development Plan](docs/development_plan_weekly.md) for details.
+Working parametric 2D sketcher with constraint solving and 3D extrusion. Now running on SDL3 GPU (Metal backend) with multi-touch support!
+
+**Current Features:**
+- ✅ 2D parametric sketching (lines, circles)
+- ✅ Constraint solver (12 constraint types)
+- ✅ 3D extrusion with parametric updates
+- ✅ SDL3 GPU rendering (Metal on macOS)
+- ✅ Multi-touch gestures (trackpad support)
+- ✅ Feature tree with dependency tracking
+
+See [Development Plan](docs/development_plan_weekly.md) for complete roadmap and [SDL3 GPU Migration Summary](docs/sdl3_gpu_migration_summary.md) for technical details.
 
 ---
 
@@ -64,16 +74,23 @@ mix_OhCAD/
 ### Prerequisites
 
 - [Odin Compiler](https://odin-lang.org/docs/install/) (latest version)
-- OpenGL 3.3+ capable graphics driver
-- macOS, Linux, or Windows
+- SDL3 (for GPU-accelerated rendering)
+- Metal-capable macOS system (for Metal backend)
+- OpenGL 3.3+ (for legacy GLFW version)
 
 ### Quick Start
 
 ```bash
-# Build the project
+# Build SDL3 GPU version (recommended)
+make gpu
+
+# Run SDL3 GPU application
+make run-gpu
+
+# Build GLFW version (legacy backup)
 make
 
-# Run the application
+# Run GLFW application
 make run
 
 # Run tests
@@ -86,14 +103,22 @@ make clean
 ### Manual Build
 
 ```bash
-# Build release version
-odin build src -out:ohcad -o:speed
+# SDL3 GPU version (recommended)
+odin build src/main_gpu.odin -file -out:bin/ohcad_gpu -debug
 
-# Build debug version
-odin build src -out:ohcad_debug -debug
+# GLFW version (legacy)
+odin build src/main.odin -file -out:bin/ohcad -debug
 
 # Run tests
 odin test tests -all-packages
+```
+
+### Shader Compilation (SDL3 GPU)
+
+```bash
+cd src/ui/viewer/shaders
+./build_shaders.sh
+# Generates line_shader.metallib (~15KB)
 ```
 
 ---
@@ -147,26 +172,30 @@ MIT License - See LICENSE file for details.
 
 ## Roadmap
 
-### Phase 1: Foundation (Weeks 1-4) ✅ In Progress
+### Phase 1: Foundation (Weeks 1-4) ✅ COMPLETE
 - [x] Project setup
-- [ ] Core math library
-- [ ] Geometry primitives
-- [ ] B-rep topology
-- [ ] Basic 3D viewer
+- [x] Core math library (57/57 tests passing)
+- [x] Geometry primitives (2D/3D)
+- [x] B-rep topology (handle-based system)
+- [x] Basic 3D viewer (GLFW + OpenGL)
 
-### Phase 2: 2D Sketcher (Weeks 5-8)
-- [ ] Sketch data model
-- [ ] Constraint system
-- [ ] 2D solver
-- [ ] Sketch UI
+### Phase 2: 2D Sketcher (Weeks 5-8) ✅ COMPLETE
+- [x] Sketch data model with coordinate transforms
+- [x] Interactive sketch tools (line, circle, select)
+- [x] Constraint system (16 constraint types)
+- [x] Levenberg-Marquardt constraint solver
+- [x] Visual constraint feedback (icons + dimensions)
+- [x] Profile detection for extrusion
 
-### Phase 3: 3D Features (Weeks 9-12)
-- [ ] Extrude/pad
-- [ ] Boolean operations
-- [ ] Revolve
-- [ ] STL export
+### Phase 3: 3D Features (Weeks 9-12) 🔄 IN PROGRESS
+- [x] **Week 9:** Extrude/pad feature with parametric updates ✅
+- [x] **Week 9.5:** SDL3 GPU migration + multi-touch gestures ✅
+- [ ] **Week 9.6:** UI framework & toolbar integration
+- [ ] **Week 10.5:** Boolean operations (cut/pocket)
+- [ ] **Week 11:** Revolve feature
+- [ ] **Week 12:** STL export & basic fillet
 
-### Phase 4: Technical Drawing (Weeks 13-16) - **MVP Complete**
+### Phase 4: Technical Drawing (Weeks 13-16) - **MVP Target**
 - [ ] Orthographic projection
 - [ ] Hidden line removal
 - [ ] Dimensioning

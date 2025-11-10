@@ -25,8 +25,8 @@ DEFAULT_VIEWER_CONFIG :: ViewerConfig{
     window_width = 1280,
     window_height = 720,
     window_title = "OhCAD Viewer",
-    gl_major_version = 3,
-    gl_minor_version = 3,
+    gl_major_version = 4,
+    gl_minor_version = 1,
     msaa_samples = 4,
 }
 

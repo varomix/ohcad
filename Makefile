@@ -60,6 +60,34 @@ run-viewer: viewer
 	@echo "Running Viewer Test..."
 	@./$(BIN_DIR)/viewer_test
 
+# Build GPU viewer test
+.PHONY: gpu-viewer
+gpu-viewer:
+	@echo "Building GPU Viewer Test..."
+	@mkdir -p $(BIN_DIR)
+	$(ODIN) build $(TEST_DIR)/gpu_viewer_test -out:$(BIN_DIR)/gpu_viewer_test $(DEBUG_FLAGS)
+	@echo "✓ GPU Viewer test complete: $(BIN_DIR)/gpu_viewer_test"
+
+# Run GPU viewer test
+.PHONY: run-gpu-viewer
+run-gpu-viewer: gpu-viewer
+	@echo "Running GPU Viewer Test..."
+	@./$(BIN_DIR)/gpu_viewer_test
+
+# Build SDL3 GPU main application
+.PHONY: gpu
+gpu:
+	@echo "Building OhCAD (SDL3 GPU)..."
+	@mkdir -p $(BIN_DIR)
+	$(ODIN) build src/main_gpu.odin -file -out:$(BIN_DIR)/ohcad_gpu $(DEBUG_FLAGS)
+	@echo "✓ SDL3 GPU build complete: $(BIN_DIR)/ohcad_gpu"
+
+# Run SDL3 GPU main application
+.PHONY: run-gpu
+run-gpu: gpu
+	@echo "Running OhCAD (SDL3 GPU)..."
+	@./$(BIN_DIR)/ohcad_gpu
+
 # Run debug version
 .PHONY: run-debug
 run-debug: debug

@@ -445,11 +445,182 @@ Test 6: Underconstrained ✅
 5. Press [TAB] → Orbit around your parametric 3D model!
 ```
 
-**Deliverable:** ✅ **Full parametric 2D→3D workflow!** Can extrude sketches into 3D solids with real-time parametric control. Feature tree manages design history and dependencies. Ready for boolean operations (Week 10)!
+**Deliverable:** ✅ **Full parametric 2D→3D workflow!** Can extrude sketches into 3D solids with real-time parametric control. Feature tree manages design history and dependencies.
+
+**Next Steps:** Before continuing with boolean operations, we need to improve the viewport and input system for better usability.
 
 ---
 
-### Week 10: Boolean Operations (Cut/Pocket)
+### Week 9.5: SDL3 GPU Migration & Multi-Touch Input ✅ COMPLETE
+**Goal:** Migrate from GLFW/OpenGL to SDL3 GPU (Metal backend) with multi-touch support
+
+**Tasks:**
+- [x] **Task 1:** SDL3 GPU backend migration:
+    - [x] Evaluate SDL3 GPU API for modern Metal/Vulkan rendering
+    - [x] Initialize SDL3 GPU device with Metal backend
+    - [x] Create graphics pipeline for line/triangle rendering
+    - [x] Implement vertex/transfer buffer management
+    - [x] Metal shader compilation (MSL → metallib format)
+- [x] **Task 2:** Port all rendering features to SDL3 GPU:
+    - [x] Grid rendering (10×10 units, 20 divisions)
+    - [x] Coordinate axes (RGB thick lines)
+    - [x] Wireframe mesh rendering (BRep, Sketch, Solid)
+    - [x] Thick line rendering (quad-based billboard approach)
+    - [x] Text rendering with fontstash (BigShoulders font)
+    - [x] Sketch points rendering (filled circular dots, 4px)
+    - [x] Preview geometry (cursor crosshair, temp lines/circles)
+    - [x] Constraint/dimension visualization (icons + dimension lines)
+- [x] **Task 3:** Implement multi-touch gestures (macOS trackpad):
+    - [x] 2-finger drag → Orbit camera
+    - [x] 2-finger pinch → Zoom in/out
+    - [x] 2-finger drag + SHIFT → Pan camera
+    - [x] SDL3 finger event handling (FINGER_DOWN, FINGER_UP, FINGER_MOTION)
+    - [x] Mouse controls still functional (middle orbit, right pan, scroll zoom)
+- [x] **Task 4:** Main application migration:
+    - [x] Port `main.odin` to `main_gpu.odin` (SDL3 GPU version)
+    - [x] Backup GLFW version (`main_glfw_backup.odin`)
+    - [x] Full feature parity with GLFW version
+    - [x] Makefile targets: `make gpu` and `make run-gpu`
+- [x] **Task 5:** Advanced UX improvements:
+    - [x] Selection highlighting (only selected entity in bright cyan)
+    - [x] Points/vertices visible as filled dots
+    - [x] Preview geometry during sketch creation
+    - [x] Constraint icons (H, V) and dimension text rendering
+    - [x] Proper aspect ratio handling with window resize
+
+**AI Agent Tasks:**
+- [x] Research SDL3 GPU API and Metal backend integration
+- [x] Implement complete graphics pipeline with shaders
+- [x] Port all GLFW rendering code to SDL3 GPU
+- [x] Create multi-touch gesture system using SDL3 finger events
+- [x] Migrate main application with full feature parity
+- [x] Add missing UX features (points, preview, constraints)
+
+**Status:** ✅ **WEEK 9.5 COMPLETE!**
+- ✅ SDL3 GPU backend fully operational (Metal on macOS)
+- ✅ All GLFW rendering features ported with 100% feature parity
+- ✅ Multi-touch gestures working smoothly on macOS trackpad
+- ✅ Improved UX: visible points, preview geometry, proper selection
+- ✅ Constraint/dimension rendering with icons and text
+- ✅ Professional CAD appearance maintained
+
+**Technical Achievements:**
+- **Rendering Backend:** SDL3 GPU API with Metal backend (hardware-accelerated)
+- **Shaders:** Custom Metal shaders (line_shader.metal → 15KB metallib)
+- **Pipelines:** Line pipeline, triangle pipeline, text pipeline
+- **Buffer Management:** Dynamic vertex buffers with transfer buffers
+- **Text Rendering:** fontstash integration with R8_UNORM texture format
+- **Multi-touch:** Native SDL3 finger events (2-finger orbit, pinch zoom, SHIFT+pan)
+- **Performance:** Hardware-accelerated GPU rendering vs software OpenGL
+
+**Build Commands:**
+```bash
+make gpu          # Build SDL3 GPU version
+make run-gpu      # Run SDL3 GPU version
+make run          # Still available for GLFW version (backup)
+```
+
+**Deliverable:** ✅ Complete SDL3 GPU migration with multi-touch support, full GLFW feature parity, and improved UX. Ready for UI framework integration (Week 9.6).
+
+---
+
+### Week 9.6: UI Framework & Toolbar 🔄 IN PROGRESS
+**Goal:** Implement immediate-mode GUI framework and basic toolbar for tool selection
+
+**Tasks:**
+- [ ] **Task 1:** Choose and integrate UI framework:
+  - [ ] Evaluate options: Dear ImGui (via Odin bindings), Raylib, custom immediate-mode UI
+  - [ ] Consider: Odin's `vendor:microui` package (lightweight immediate-mode GUI)
+  - [ ] Integration with OpenGL rendering pipeline
+  - [ ] Font rendering integration (reuse BigShoulders font)
+- [ ] **Task 2:** Create basic toolbar layout:
+  - [ ] Top toolbar with tool buttons
+  - [ ] Icon system (simple shapes or Unicode symbols for now)
+  - [ ] Button states: normal, hover, pressed, active
+  - [ ] Tool categories: Sketch Tools, 3D Tools, Constraint Tools
+- [ ] **Task 3:** Replace keyboard shortcuts with toolbar clicks:
+  - [ ] Line tool button (currently [L])
+  - [ ] Circle tool button (currently [C])
+  - [ ] Select tool button (currently [S])
+  - [ ] Dimension tool button (currently [D])
+  - [ ] Visual feedback for active tool
+- [ ] **Task 4:** Integrate toolbar with existing tool system:
+  - [ ] Toolbar clicks call `sketch_set_tool()`
+  - [ ] Highlight active tool in toolbar
+  - [ ] Keyboard shortcuts still work (power users)
+  - [ ] Tool tips on hover
+
+**AI Agent Tasks:**
+- Research and recommend UI framework for Odin
+- Implement toolbar rendering and interaction
+- Create tool button system with icons
+- Integrate with existing sketch tool system
+
+**Deliverable:** Working toolbar with clickable tool buttons, replacing keyboard-only workflow
+
+---
+
+### Week 12.5: Advanced UI & Tool Palette 🔜 PLANNED
+**Goal:** Professional tool palette with search, radial menus, and hover highlights
+
+**Tasks:**
+- [ ] **Task 1:** Tool palette with search:
+  - [ ] [S] shortcut → Pop up tool palette overlay
+  - [ ] Search input at top (type to filter tools)
+  - [ ] Categorized tool list (Sketch, 3D, Constraints, etc.)
+  - [ ] Favorite tools section (user-customizable)
+  - [ ] Recently used tools
+  - [ ] Click tool to activate and close palette
+- [ ] **Task 2:** Radial menu system:
+  - [ ] Context-aware radial menus (Sketch mode vs 3D mode)
+  - [ ] Radial menu for Solid tools (Extrude, Cut, Revolve, Fillet)
+  - [ ] Radial menu for Surface tools (placeholder for future)
+  - [ ] Radial menu for Sketch tools (Line, Circle, Arc, Dimension)
+  - [ ] Shortcut key to pop radial menu for current mode
+  - [ ] Mouse gesture or click to select tool
+- [ ] **Task 3:** Hover highlights:
+  - [ ] Detect mouse hover over points (hit testing with tolerance)
+  - [ ] Detect mouse hover over edges (distance to line/circle)
+  - [ ] Highlight hovered entities in different color (bright white/yellow)
+  - [ ] Show tooltip with entity info (Point #3, Line #5, etc.)
+  - [ ] Preview dimension value when hovering over constraints
+- [ ] **Task 4:** Closed shape visualization:
+  - [ ] Detect closed profiles in sketch (already have this in `profile.odin`)
+  - [ ] Shade closed shapes with subtle fill color (e.g., dark cyan at 20% opacity)
+  - [ ] Render fill behind wireframe
+  - [ ] Toggle shading on/off (view option)
+- [ ] **Task 5:** Line tool improvements:
+  - [ ] Detect when line tool closes a shape (start point == end point within threshold)
+  - [ ] Automatically exit line tool after closing shape (return to Select mode)
+  - [ ] Visual feedback when shape is about to close (highlight start point)
+  - [ ] Optional: Allow continue drawing in separate profile (user choice)
+
+**AI Agent Tasks:**
+- Implement tool palette overlay with search functionality
+- Create radial menu system with context awareness
+- Implement hover detection and highlighting for points/edges
+- Add closed shape shading with transparency
+- Improve line tool to auto-exit on shape closure
+
+**Deliverable:** Professional CAD UI with searchable tool palette, radial menus, hover highlights, and smart line tool behavior
+
+---
+
+## Updated Schedule
+
+**Important:** Weeks 9.5, 9.6, and 12.5 are now inserted as **priority tasks** before continuing with the original plan. The boolean operations (formerly Week 10) will now happen after these UI improvements are complete.
+
+### Revised Timeline:
+- **Week 9:** ✅ COMPLETE - Extrude feature and parametric system
+- **Week 9.5:** 🔄 IN PROGRESS - Viewport aspect ratio & multi-touch input
+- **Week 9.6:** 🔄 IN PROGRESS - UI framework & toolbar
+- **Week 10:** → Renamed to **Week 10.5** (Boolean Operations)
+- **Week 12.5:** 🔜 PLANNED - Advanced UI (tool palette, radial menus, hover)
+- **Week 11-12:** → Continue as originally planned after UI improvements
+
+---
+
+### Week 10.5: Boolean Operations (Cut/Pocket)
 **Goal:** Boolean subtract for pocket/cut features
 
 **Tasks:**
