@@ -4,6 +4,7 @@ package ohcad_viewer
 import "core:fmt"
 import "core:math"
 import sketch "../../features/sketch"
+import extrude "../../features/extrude"
 import m "../../core/math"
 import glsl "core:math/linalg/glsl"
 
@@ -277,7 +278,7 @@ render_sketch_preview :: proc(shader: ^LineShader, sk: ^sketch.Sketch2D, mvp: gl
 }
 
 // Render constraint icons/indicators
-render_sketch_constraints :: proc(shader: ^LineShader, sk: ^sketch.Sketch2D, mvp: glsl.mat4) {
+render_sketch_constraints :: proc(shader: ^LineShader, sk: ^sketch.Sketch2D, mvp: glsl.mat4, text_renderer: ^TextRenderer = nil, view: glsl.mat4 = {}, proj: glsl.mat4 = {}, viewport_width: i32 = 0, viewport_height: i32 = 0) {
     if sk == nil do return
     if sk.constraints == nil do return
     if len(sk.constraints) == 0 do return
@@ -301,7 +302,7 @@ render_sketch_constraints :: proc(shader: ^LineShader, sk: ^sketch.Sketch2D, mvp
             render_parallel_icon(shader, sk, data, mvp, icon_size)
 
         case sketch.DistanceData:
-            render_distance_dimension(shader, sk, data, mvp)
+            render_distance_dimension(shader, sk, data, mvp, text_renderer, view, proj, viewport_width, viewport_height)
 
         case sketch.DistanceXData:
             render_distance_x_dimension(shader, sk, data, mvp)
@@ -545,22 +546,88 @@ render_equal_icon :: proc(shader: ^LineShader, sk: ^sketch.Sketch2D, data: sketc
 }
 
 // Helper: Render distance dimension
-render_distance_dimension :: proc(shader: ^LineShader, sk: ^sketch.Sketch2D, data: sketch.DistanceData, mvp: glsl.mat4) {
-    if data.point1_id < 0 || data.point1_id >= len(sk.points) do return
-    if data.point2_id < 0 || data.point2_id >= len(sk.points) do return
+render_distance_dimension :: proc(shader: ^LineShader, sk: ^sketch.Sketch2D, data: sketch.DistanceData, mvp: glsl.mat4, text_renderer: ^TextRenderer = nil, view: glsl.mat4 = {}, proj: glsl.mat4 = {}, viewport_width: i32 = 0, viewport_height: i32 = 0) {
+	if data.point1_id < 0 || data.point1_id >= len(sk.points) do return
+	if data.point2_id < 0 || data.point2_id >= len(sk.points) do return
 
-    p1 := sketch.sketch_get_point(sk, data.point1_id)
-    p2 := sketch.sketch_get_point(sk, data.point2_id)
-    if p1 == nil || p2 == nil do return
+	p1 := sketch.sketch_get_point(sk, data.point1_id)
+	p2 := sketch.sketch_get_point(sk, data.point2_id)
+	if p1 == nil || p2 == nil do return
 
-    p1_3d := sketch.sketch_to_world(&sk.plane, m.Vec2{p1.x, p1.y})
-    p2_3d := sketch.sketch_to_world(&sk.plane, m.Vec2{p2.x, p2.y})
+	p1_2d := m.Vec2{p1.x, p1.y}
+	p2_2d := m.Vec2{p2.x, p2.y}
 
-    // Draw dimension line between points
-    dim_verts := []m.Vec3{p1_3d, p2_3d}
-    line_shader_draw(shader, dim_verts, {1.0, 1.0, 0.0, 1.0}, mvp, 2.5)  // Bright yellow, thicker
+	// Calculate direction vector from p1 to p2
+	edge_vec := p2_2d - p1_2d
+	edge_len := glsl.length(edge_vec)
+	if edge_len < 1e-10 do return  // Degenerate edge
 
-    // TODO: Add dimension text rendering (Week 8 Task 3)
+	edge_dir := edge_vec / edge_len
+
+	// Calculate perpendicular vector (rotate 90 degrees)
+	perp_dir := m.Vec2{-edge_dir.y, edge_dir.x}
+
+	// Project offset position onto perpendicular axis to get offset distance
+	mid := (p1_2d + p2_2d) * 0.5
+	to_offset := data.offset - mid
+	offset_distance := glsl.dot(to_offset, perp_dir)
+
+	// Ensure minimum offset (so it doesn't overlap the edge)
+	MIN_OFFSET :: 0.3
+	if glsl.abs(offset_distance) < MIN_OFFSET {
+		offset_distance = MIN_OFFSET * glsl.sign(offset_distance)
+		if offset_distance == 0 {
+			offset_distance = MIN_OFFSET  // Default to positive side
+		}
+	}
+
+	// Calculate dimension line endpoints (parallel to edge, offset perpendicular)
+	dim1_2d := p1_2d + perp_dir * offset_distance
+	dim2_2d := p2_2d + perp_dir * offset_distance
+
+	dim1_3d := sketch.sketch_to_world(&sk.plane, dim1_2d)
+	dim2_3d := sketch.sketch_to_world(&sk.plane, dim2_2d)
+
+	// Build all lines in one go
+	dim_verts := make([dynamic]m.Vec3, 0, 8)
+	defer delete(dim_verts)
+
+	// Extension line from p1 to dimension line
+	append(&dim_verts, sketch.sketch_to_world(&sk.plane, p1_2d))
+	append(&dim_verts, dim1_3d)
+
+	// Extension line from p2 to dimension line
+	append(&dim_verts, sketch.sketch_to_world(&sk.plane, p2_2d))
+	append(&dim_verts, dim2_3d)
+
+	// Dimension line itself
+	append(&dim_verts, dim1_3d)
+	append(&dim_verts, dim2_3d)
+
+	// Draw all lines in bright yellow
+	line_shader_draw(shader, dim_verts[:], {1.0, 1.0, 0.0, 1.0}, mvp, 2.5)
+
+	// Render dimension text value
+	if text_renderer != nil && viewport_width > 0 && viewport_height > 0 {
+		// Calculate midpoint of dimension line in 3D
+		mid_dim_3d := (dim1_3d + dim2_3d) * 0.5
+
+		// Project 3D midpoint to screen space
+		clip_pos := proj * view * glsl.vec4{f32(mid_dim_3d.x), f32(mid_dim_3d.y), f32(mid_dim_3d.z), 1.0}
+
+		if clip_pos.w != 0.0 {
+			// Convert from clip space [-1,1] to screen space [0, width/height]
+			ndc := clip_pos.xyz / clip_pos.w
+			screen_x := (ndc.x + 1.0) * 0.5 * f32(viewport_width)
+			screen_y := (1.0 - ndc.y) * 0.5 * f32(viewport_height)  // Flip Y axis
+
+			// Format distance value as string
+			dist_text := fmt.tprintf("%.2f", data.distance)
+
+			// Render text at screen position (bright yellow to match dimension line)
+			text_render_2d(text_renderer, dist_text, screen_x, screen_y, 16, {255, 255, 0, 255})
+		}
+	}
 }
 
 // Helper: Render horizontal distance dimension
@@ -595,6 +662,28 @@ render_distance_x_dimension :: proc(shader: ^LineShader, sk: ^sketch.Sketch2D, d
     // Dimension line
     dim_verts := []m.Vec3{p1_dim_3d, p2_dim_3d}
     line_shader_draw(shader, dim_verts, {1.0, 1.0, 0.0, 1.0}, mvp, 2.5)  // Bright yellow, thicker
+}
+
+// =============================================================================
+// 3D Solid Rendering
+// =============================================================================
+
+// Convert SimpleSolid to wireframe mesh for rendering
+solid_to_wireframe :: proc(solid: ^extrude.SimpleSolid) -> WireframeMesh {
+    mesh := wireframe_mesh_init()
+
+    if solid == nil {
+        return mesh
+    }
+
+    // Add all edges from solid
+    for edge in solid.edges {
+        if edge.v0 != nil && edge.v1 != nil {
+            wireframe_mesh_add_edge(&mesh, edge.v0.position, edge.v1.position)
+        }
+    }
+
+    return mesh
 }
 
 // Helper: Render vertical distance dimension

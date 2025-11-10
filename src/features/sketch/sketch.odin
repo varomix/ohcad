@@ -67,6 +67,7 @@ SketchTool :: enum {
     Line,
     Circle,
     Arc,
+    Dimension,  // Distance dimension tool
 }
 
 // 2D Sketch data structure
@@ -93,7 +94,8 @@ Sketch2D :: struct {
     current_tool: SketchTool,
     temp_point: m.Vec2,          // Temporary point for preview
     temp_point_valid: bool,      // Is temp point valid?
-    first_point_id: int,         // First point in line tool (-1 if none)
+    first_point_id: int,         // First point in tool operations (-1 if none)
+    second_point_id: int,        // Second point for dimension tool (-1 if none)
 }
 
 // =============================================================================

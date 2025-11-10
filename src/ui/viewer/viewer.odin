@@ -4,10 +4,11 @@ package ohcad_viewer
 import "core:fmt"
 import "core:math"
 import "base:runtime"
+import m "../../core/math"
 import glfw "vendor:glfw"
 import gl "vendor:OpenGL"
-import m "../../core/math"
 import glsl "core:math/linalg/glsl"
+import fs "vendor:fontstash"
 
 // Viewer configuration
 ViewerConfig :: struct {
@@ -205,10 +206,8 @@ viewer_end_frame :: proc(viewer: ^Viewer) {
 
 // Process keyboard input
 viewer_process_input :: proc(viewer: ^Viewer) {
-    // ESC to close
-    if glfw.GetKey(viewer.window, glfw.KEY_ESCAPE) == glfw.PRESS {
-        viewer.should_close = true
-    }
+    // Note: Keyboard input is handled by custom callbacks in main.odin
+    // ESC key is handled there to cancel tools, not to close the app
 }
 
 // =============================================================================

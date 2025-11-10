@@ -67,6 +67,7 @@ DistanceData :: struct {
     point1_id: int,
     point2_id: int,
     distance: f64,
+    offset: m.Vec2,  // Offset position for dimension line placement (where user clicked)
 }
 
 // DistanceX: Horizontal distance between two points

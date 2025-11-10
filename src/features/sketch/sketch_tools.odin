@@ -34,23 +34,54 @@ sketch_handle_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
     case .Arc:
         // TODO: Arc tool
         fmt.println("Arc tool - not yet implemented")
+
+    case .Dimension:
+        handle_dimension_tool_click(sketch, click_pos)
     }
 }
 
 // Handle line tool clicks
 handle_line_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
-    if sketch.first_point_id == -1 {
-        // First click - create start point
-        sketch.first_point_id = sketch_add_point(sketch, click_pos.x, click_pos.y)
-        fmt.printf("Line tool: Start point created at (%.3f, %.3f)\n", click_pos.x, click_pos.y)
-    } else {
-        // Second click - create end point and line
-        end_point_id := sketch_add_point(sketch, click_pos.x, click_pos.y)
-        sketch_add_line(sketch, sketch.first_point_id, end_point_id)
-        fmt.printf("Line tool: Line created from point %d to %d\n", sketch.first_point_id, end_point_id)
+    // Snap threshold - if clicking within 0.2 units of existing point, snap to it
+    SNAP_THRESHOLD :: 0.2
 
-        // Reset for next line (or continue chain if shift is held)
-        sketch.first_point_id = -1
+    if sketch.first_point_id == -1 {
+        // First click - try to snap to existing point, or create new one
+        snapped_id, found := sketch_find_nearest_point(sketch, click_pos, SNAP_THRESHOLD)
+
+        if found {
+            sketch.first_point_id = snapped_id
+            pt := sketch_get_point(sketch, snapped_id)
+            fmt.printf("Line tool: Snapped to existing point %d at (%.3f, %.3f)\n", snapped_id, pt.x, pt.y)
+        } else {
+            sketch.first_point_id = sketch_add_point(sketch, click_pos.x, click_pos.y)
+            fmt.printf("Line tool: Start point created at (%.3f, %.3f)\n", click_pos.x, click_pos.y)
+        }
+    } else {
+        // Second click - try to snap to existing point, or create new one
+        snapped_id, found := sketch_find_nearest_point(sketch, click_pos, SNAP_THRESHOLD)
+
+        end_point_id: int
+        if found {
+            end_point_id = snapped_id
+            pt := sketch_get_point(sketch, snapped_id)
+            fmt.printf("Line tool: Snapped to existing point %d at (%.3f, %.3f)\n", snapped_id, pt.x, pt.y)
+        } else {
+            end_point_id = sketch_add_point(sketch, click_pos.x, click_pos.y)
+        }
+
+        // Don't create line if start and end are the same point
+        if sketch.first_point_id != end_point_id {
+            sketch_add_line(sketch, sketch.first_point_id, end_point_id)
+            fmt.printf("Line tool: Line created from point %d to %d\n", sketch.first_point_id, end_point_id)
+
+            // CHAIN: Continue from this endpoint (like OnShape)
+            // Set the endpoint as the new start point for the next line
+            sketch.first_point_id = end_point_id
+            fmt.println("  → Continuing from endpoint (press ESC to finish)")
+        } else {
+            fmt.println("Line tool: Cannot create line - start and end points are the same")
+        }
     }
 }
 
@@ -79,6 +110,7 @@ handle_circle_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
 // Cancel current tool operation
 sketch_cancel_tool :: proc(sketch: ^Sketch2D) {
     sketch.first_point_id = -1
+    sketch.second_point_id = -1
     sketch.temp_point_valid = false
 }
 
@@ -266,5 +298,84 @@ sketch_delete_point :: proc(sketch: ^Sketch2D, point_id: int) {
             ordered_remove(&sketch.points, i)
             return
         }
+    }
+}
+
+// =============================================================================
+// Dimension Tool
+// =============================================================================
+
+// Handle dimension tool clicks (3-click workflow: point1, point2, placement)
+handle_dimension_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
+    // Snap threshold - if clicking within 0.2 units of existing point, snap to it
+    SNAP_THRESHOLD :: 0.2
+
+    if sketch.first_point_id == -1 {
+        // CLICK 1: Select first point
+        snapped_id, found := sketch_find_nearest_point(sketch, click_pos, SNAP_THRESHOLD)
+
+        if found {
+            sketch.first_point_id = snapped_id
+            pt := sketch_get_point(sketch, snapped_id)
+            fmt.printf("Dimension: Point 1 selected (ID=%d) at (%.3f, %.3f)\n", snapped_id, pt.x, pt.y)
+            fmt.println("  → Click second point")
+        } else {
+            fmt.println("❌ No point found - click near an existing point")
+        }
+    } else if sketch.second_point_id == -1 {
+        // CLICK 2: Select second point
+        snapped_id, found := sketch_find_nearest_point(sketch, click_pos, SNAP_THRESHOLD)
+
+        if !found {
+            fmt.println("❌ No point found - click near an existing point")
+            return
+        }
+
+        if snapped_id == sketch.first_point_id {
+            fmt.println("❌ Cannot dimension between the same point")
+            sketch.first_point_id = -1
+            return
+        }
+
+        sketch.second_point_id = snapped_id
+        pt := sketch_get_point(sketch, snapped_id)
+        fmt.printf("Dimension: Point 2 selected (ID=%d) at (%.3f, %.3f)\n", snapped_id, pt.x, pt.y)
+        fmt.println("  → Click to place dimension line (anywhere to confirm)")
+    } else {
+        // CLICK 3: Place dimension at offset position
+
+        // Get both points
+        pt1 := sketch_get_point(sketch, sketch.first_point_id)
+        pt2 := sketch_get_point(sketch, sketch.second_point_id)
+
+        if pt1 == nil || pt2 == nil {
+            fmt.println("❌ Invalid points")
+            sketch.first_point_id = -1
+            sketch.second_point_id = -1
+            return
+        }
+
+        // Calculate distance between points
+        p1 := m.Vec2{pt1.x, pt1.y}
+        p2 := m.Vec2{pt2.x, pt2.y}
+        distance := glsl.length(p2 - p1)
+
+        // Add distance constraint with current distance value AND offset position
+        constraint_id := sketch_add_constraint(sketch, .Distance, DistanceData{
+            point1_id = sketch.first_point_id,
+            point2_id = sketch.second_point_id,
+            distance = distance,
+            offset = click_pos,  // Store where user clicked for placement
+        })
+
+        fmt.printf("✅ Dimension created: %.3f units between points %d and %d\n",
+            distance, sketch.first_point_id, sketch.second_point_id)
+        fmt.printf("   Placed at offset (%.3f, %.3f)\n", click_pos.x, click_pos.y)
+        fmt.printf("   Constraint ID: %d\n", constraint_id)
+
+        // Reset for next dimension (stay in Dimension tool)
+        sketch.first_point_id = -1
+        sketch.second_point_id = -1
+        fmt.println("  → Ready for next dimension (or press ESC to finish)")
     }
 }
