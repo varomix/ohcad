@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:os"
 import "base:runtime"
 import v "ui/viewer"
+import ui "ui/widgets"
 import sketch "features/sketch"
 import extrude "features/extrude"
 import ftree "features/feature_tree"
@@ -16,6 +17,8 @@ import sdl "vendor:sdl3"
 AppStateGPU :: struct {
     viewer: ^v.ViewerGPU,
     text_renderer: v.TextRendererGPU,
+    ui_context: ui.UIContext,  // UI framework context
+    cad_ui_state: ui.CADUIState,  // CAD-specific UI state
     sketch: ^sketch.Sketch2D,
     wireframe: v.WireframeMeshGPU,
     wireframe_selected: v.WireframeMeshGPU,
@@ -36,6 +39,7 @@ AppStateGPU :: struct {
     // Input state for sketch interaction
     mouse_x: f64,
     mouse_y: f64,
+    mouse_down_left: bool,  // Track left mouse button separately
     ctrl_held: bool,
 }
 
@@ -157,6 +161,8 @@ main :: proc() {
     app := new(AppStateGPU)
     app.viewer = viewer_inst
     app.text_renderer = text_renderer
+    app.ui_context = ui.ui_context_init(viewer_inst, &text_renderer)
+    app.cad_ui_state = ui.cad_ui_state_init()
     app.sketch = sk
     app.wireframe = wireframe
     app.wireframe_selected = wireframe_selected
@@ -166,6 +172,7 @@ main :: proc() {
     app.solid_wireframes = make([dynamic]v.WireframeMeshGPU)
     app.needs_wireframe_update = false
     app.needs_selection_update = false
+
     defer {
         for &mesh in app.solid_wireframes {
             v.wireframe_mesh_gpu_destroy(&mesh)
@@ -254,6 +261,11 @@ handle_events_gpu :: proc(app: ^AppStateGPU) {
             v.viewer_gpu_handle_mouse_motion(app.viewer, &event.motion)
 
         case .MOUSE_BUTTON_DOWN, .MOUSE_BUTTON_UP:
+            // Track left button state for UI
+            if event.button.button == u8(sdl.BUTTON_LEFT) {
+                app.mouse_down_left = event.button.down
+            }
+
             handle_mouse_button_gpu(app, &event.button)
             v.viewer_gpu_handle_mouse_button(app.viewer, &event.button)
 
@@ -348,6 +360,11 @@ handle_key_up_gpu :: proc(app: ^AppStateGPU, key: sdl.Keycode, mods: sdl.Keymod)
 // Handle mouse button events
 handle_mouse_button_gpu :: proc(app: ^AppStateGPU, button: ^sdl.MouseButtonEvent) {
     if button.button == u8(sdl.BUTTON_LEFT) && button.down {
+        // Check if mouse is over UI - if so, don't process sketch tools
+        if app.ui_context.mouse_over_ui {
+            return
+        }
+
         // Left click - sketch tools
         sketch_pos, ok := screen_to_sketch_gpu(app, app.mouse_x, app.mouse_y)
         if !ok {
@@ -508,17 +525,35 @@ render_frame_gpu :: proc(app: ^AppStateGPU) {
         // Render text overlay
         v.text_render_2d_gpu(&app.text_renderer, cmd, pass, "OhCAD v0.1 - SDL3 GPU", 20, 20, 44, {0, 255, 255, 255}, w, h)
 
-        // Render current tool info
-        tool_name := "Unknown"
-        switch app.sketch.current_tool {
-        case .Select: tool_name = "Select"
-        case .Line: tool_name = "Line"
-        case .Circle: tool_name = "Circle"
-        case .Arc: tool_name = "Arc"
-        case .Dimension: tool_name = "Dimension"
+        // ========== Real CAD UI ==========
+        // Begin UI frame
+        ui.ui_begin_frame(
+            &app.ui_context,
+            cmd,
+            pass,
+            w, h,
+            f32(app.mouse_x),
+            f32(app.mouse_y),
+            app.mouse_down_left,
+        )
+
+        // Render CAD UI layout (toolbar, properties, feature tree, status bar)
+        needs_update := ui.ui_cad_layout(
+            &app.ui_context,
+            &app.cad_ui_state,
+            app.sketch,
+            &app.feature_tree,
+            app.extrude_feature_id,
+            w, h,
+        )
+
+        // If properties changed (e.g., extrude depth), update solids
+        if needs_update {
+            update_solid_wireframes_gpu(app)
         }
-        tool_text := fmt.tprintf("Tool: %s", tool_name)
-        v.text_render_2d_gpu(&app.text_renderer, cmd, pass, tool_text, 20, 64, 36, {200, 200, 200, 255}, w, h)
+
+        // End UI frame
+        ui.ui_end_frame(&app.ui_context)
 
         sdl.EndGPURenderPass(pass)
     }
@@ -557,6 +592,7 @@ test_extrude_gpu :: proc(app: ^AppStateGPU) {
     }
 
     app.extrude_feature_id = extrude_id
+    app.cad_ui_state.temp_extrude_depth = 1.0  // Initialize UI state
 
     if !ftree.feature_regenerate(&app.feature_tree, extrude_id) {
         fmt.println("❌ Failed to regenerate extrude")

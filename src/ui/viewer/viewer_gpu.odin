@@ -6,6 +6,7 @@ import "core:fmt"
 import "core:math"
 import "core:os"
 import "core:strings"
+import "core:image/png"
 import m "../../core/math"
 import t "../../core/topology"
 import sketch "../../features/sketch"
@@ -202,6 +203,9 @@ TextRendererGPU :: struct {
     // Texture size
     texture_width: int,
     texture_height: int,
+
+    // Track if texture has been uploaded
+    texture_uploaded: bool,
 }
 
 // Initialize text renderer for SDL3 GPU
@@ -209,9 +213,10 @@ text_renderer_gpu_init :: proc(gpu_device: ^sdl.GPUDevice, window: ^sdl.Window, 
     renderer: TextRendererGPU
     renderer.gpu_device = gpu_device
 
-    // Initialize fontstash context (512x512 texture atlas)
-    renderer.texture_width = 512
-    renderer.texture_height = 512
+    // Initialize fontstash context (1024x1024 texture atlas for plenty of space)
+    // Larger atlas prevents reorganization which would corrupt existing text
+    renderer.texture_width = 1024
+    renderer.texture_height = 1024
     fs.Init(&renderer.font_context, renderer.texture_width, renderer.texture_height, .TOPLEFT)
 
     // Load custom BigShoulders font from assets
@@ -226,6 +231,11 @@ text_renderer_gpu_init :: proc(gpu_device: ^sdl.GPUDevice, window: ^sdl.Window, 
 
     renderer.font_id = font_id
     fmt.printf("✓ Loaded custom font: %s\n", font_path)
+
+    // CRITICAL FIX: Reset font atlas to clear any stale packing data
+    // This ensures UV coordinates match where glyphs are actually rasterized
+    fs.ResetAtlas(&renderer.font_context, renderer.texture_width, renderer.texture_height)
+    fmt.println("✓ Font atlas reset (cleared stale packing data)")
 
     // Create text vertex shader
     text_vertex_shader_info := sdl.GPUShaderCreateInfo{
@@ -270,9 +280,10 @@ text_renderer_gpu_init :: proc(gpu_device: ^sdl.GPUDevice, window: ^sdl.Window, 
     renderer.text_fragment_shader = text_fragment_shader
 
     // Create font atlas texture (R8 format for single-channel grayscale)
+    // REVERT to original working format
     texture_info := sdl.GPUTextureCreateInfo{
         type = .D2,
-        format = .R8_UNORM,  // Single channel for alpha
+        format = .R8_UNORM,  // Single channel for alpha (original working format)
         usage = {.SAMPLER},
         width = u32(renderer.texture_width),
         height = u32(renderer.texture_height),
@@ -312,6 +323,11 @@ text_renderer_gpu_init :: proc(gpu_device: ^sdl.GPUDevice, window: ^sdl.Window, 
     }
 
     renderer.font_sampler = font_sampler
+
+    // NOTE: Don't upload texture during init - fontstash hasn't rasterized any glyphs yet!
+    // The texture will be uploaded on first text render after glyphs are generated
+    renderer.texture_uploaded = false
+    fmt.println("✓ Font texture will be uploaded on first text render")
 
     // Create text rendering pipeline
     vertex_attributes := []sdl.GPUVertexAttribute{
@@ -428,9 +444,20 @@ text_render_2d_gpu :: proc(
     vertices: [1024]TextVertex  // Max 256 quads (4 verts each)
     vertex_count := 0
 
+    // CRITICAL: Force fontstash to flush/render glyphs into texture BEFORE iterating
+    // This ensures the glyphs are actually rasterized into textureData
     iter := fs.TextIterInit(&renderer.font_context, x, y, text)
     quad: fs.Quad
+    quad_count := 0
+
+    // Collect all quads first
+    temp_quads := make([dynamic]fs.Quad, context.temp_allocator)
     for fs.TextIterNext(&renderer.font_context, &iter, &quad) {
+        append(&temp_quads, quad)
+    }
+
+    // Now convert quads to vertices
+    for quad in temp_quads {
         if vertex_count + 6 > len(vertices) {
             break  // Buffer full
         }
@@ -450,12 +477,9 @@ text_render_2d_gpu :: proc(
 
     if vertex_count == 0 do return
 
-    // Update font atlas texture if needed
-    dirty: [4]f32
-    if fs.ValidateTexture(&renderer.font_context, &dirty) {
-        // Upload entire texture (simpler and more reliable)
-        text_renderer_gpu_update_texture(renderer, cmd)
-    }
+    // ALWAYS upload texture before rendering text (ensures latest glyphs are on GPU)
+    // Fontstash may add new glyphs to the atlas dynamically - this is normal!
+    text_renderer_gpu_update_texture(renderer)
 
     // Create temporary vertex buffer for text
     buffer_info := sdl.GPUBufferCreateInfo{
@@ -544,9 +568,11 @@ text_render_2d_gpu :: proc(
 }
 
 // Update font atlas texture (upload to GPU)
-text_renderer_gpu_update_texture :: proc(renderer: ^TextRendererGPU, cmd: ^sdl.GPUCommandBuffer) {
-    // Create transfer buffer for texture data
+// IMPORTANT: This must be called BEFORE rendering text in the same frame
+text_renderer_gpu_update_texture :: proc(renderer: ^TextRendererGPU) {
+    // Create transfer buffer for R8 texture data
     texture_size := u32(renderer.texture_width * renderer.texture_height)
+
     transfer_info := sdl.GPUTransferBufferCreateInfo{
         usage = .UPLOAD,
         size = texture_size,
@@ -559,24 +585,29 @@ text_renderer_gpu_update_texture :: proc(renderer: ^TextRendererGPU, cmd: ^sdl.G
     }
     defer sdl.ReleaseGPUTransferBuffer(renderer.gpu_device, transfer_buffer)
 
-    // Map and copy texture data
+    // Map and copy R8 texture data directly (NO conversion)
     transfer_ptr := sdl.MapGPUTransferBuffer(renderer.gpu_device, transfer_buffer, false)
     if transfer_ptr == nil {
         fmt.eprintln("ERROR: Failed to map transfer buffer for font texture")
         return
     }
 
+    // Copy R8 data directly - no conversion
     dest_slice := ([^]u8)(transfer_ptr)[:texture_size]
     copy(dest_slice, renderer.font_context.textureData[:texture_size])
+
     sdl.UnmapGPUTransferBuffer(renderer.gpu_device, transfer_buffer)
 
-    // Upload to texture
+    // Upload to texture - use a dedicated command buffer and wait for completion
+    // This ensures the texture is fully uploaded before any rendering happens
     upload_cmd := sdl.AcquireGPUCommandBuffer(renderer.gpu_device)
     copy_pass := sdl.BeginGPUCopyPass(upload_cmd)
 
     src := sdl.GPUTextureTransferInfo{
         transfer_buffer = transfer_buffer,
         offset = 0,
+        pixels_per_row = u32(renderer.texture_width),
+        rows_per_layer = u32(renderer.texture_height),
     }
 
     dst := sdl.GPUTextureRegion{
@@ -589,7 +620,39 @@ text_renderer_gpu_update_texture :: proc(renderer: ^TextRendererGPU, cmd: ^sdl.G
     sdl.UploadToGPUTexture(copy_pass, src, dst, false)
     sdl.EndGPUCopyPass(copy_pass)
     _ = sdl.SubmitGPUCommandBuffer(upload_cmd)
+
+    // CRITICAL: Wait for texture upload to complete before proceeding
+    // Without this, rendering might use the old/corrupted texture data
+    _ = sdl.WaitForGPUIdle(renderer.gpu_device)
 }
+
+// DEBUG: Save font atlas texture to file for inspection
+// DISABLED FOR NOW - focus on console debugging output
+/*
+text_renderer_gpu_save_atlas_debug :: proc(renderer: ^TextRendererGPU, filename: string) {
+
+    // Convert R8 atlas to RGBA for PNG output
+    r8_size := renderer.texture_width * renderer.texture_height
+    rgba_data := make([]u8, r8_size * 4)
+    defer delete(rgba_data)
+
+    for i in 0..<r8_size {
+        val := renderer.font_context.textureData[i]
+        rgba_data[i*4 + 0] = val  // R
+        rgba_data[i*4 + 1] = val  // G
+        rgba_data[i*4 + 2] = val  // B
+        rgba_data[i*4 + 3] = 255  // A (full opacity for visibility)
+    }
+
+    // Save as PNG
+    ok := png.write_to_file(filename, rgba_data, i32(renderer.texture_width), i32(renderer.texture_height), 4)
+    if ok {
+        fmt.printf("✅ Saved font atlas to: %s\n", filename)
+    } else {
+        fmt.printf("❌ Failed to save font atlas to: %s\n", filename)
+    }
+}
+*/
 
 // Measure text bounds
 text_measure_gpu :: proc(renderer: ^TextRendererGPU, text: string, size: f32) -> (width: f32, height: f32) {

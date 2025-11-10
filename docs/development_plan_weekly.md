@@ -524,87 +524,60 @@ make run          # Still available for GLFW version (backup)
 
 ---
 
-### Week 9.6: UI Framework & Toolbar 🔄 IN PROGRESS
+### Week 9.6: UI Framework & Toolbar ✅ COMPLETE
 **Goal:** Implement immediate-mode GUI framework and basic toolbar for tool selection
 
 **Tasks:**
-- [ ] **Task 1:** Choose and integrate UI framework:
-  - [ ] Evaluate options: Dear ImGui (via Odin bindings), Raylib, custom immediate-mode UI
-  - [ ] Consider: Odin's `vendor:microui` package (lightweight immediate-mode GUI)
-  - [ ] Integration with OpenGL rendering pipeline
-  - [ ] Font rendering integration (reuse BigShoulders font)
-- [ ] **Task 2:** Create basic toolbar layout:
-  - [ ] Top toolbar with tool buttons
-  - [ ] Icon system (simple shapes or Unicode symbols for now)
-  - [ ] Button states: normal, hover, pressed, active
-  - [ ] Tool categories: Sketch Tools, 3D Tools, Constraint Tools
-- [ ] **Task 3:** Replace keyboard shortcuts with toolbar clicks:
-  - [ ] Line tool button (currently [L])
-  - [ ] Circle tool button (currently [C])
-  - [ ] Select tool button (currently [S])
-  - [ ] Dimension tool button (currently [D])
-  - [ ] Visual feedback for active tool
-- [ ] **Task 4:** Integrate toolbar with existing tool system:
-  - [ ] Toolbar clicks call `sketch_set_tool()`
-  - [ ] Highlight active tool in toolbar
-  - [ ] Keyboard shortcuts still work (power users)
-  - [ ] Tool tips on hover
+- [x] **Task 1:** Choose and integrate UI framework:
+  - [x] Custom immediate-mode UI framework implemented (`widgets.odin`)
+  - [x] SDL3 GPU integration for rendering
+  - [x] Font rendering integration with BigShoulders font (22pt & 18pt sizes)
+  - [x] Text rendering with fontstash library
+- [x] **Task 2:** Create basic toolbar layout:
+  - [x] Right-side toolbar with tool buttons (4x2 grid layout)
+  - [x] Color-coded icon system using text abbreviations (SL, LN, CR, AR, DM)
+  - [x] Button states: normal, hover, active (all implemented)
+  - [x] Sketch tools section (5 tools: Select, Line, Circle, Arc, Dimension)
+- [x] **Task 3:** Replace keyboard shortcuts with toolbar clicks:
+  - [x] Line tool button (LN - green) replaces [L] key
+  - [x] Circle tool button (CR - orange) replaces [C] key
+  - [x] Select tool button (SL - blue) replaces [S] key
+  - [x] Dimension tool button (DM - yellow) replaces [D] key
+  - [x] Arc tool button (AR - pink) added
+  - [x] Visual feedback for active tool (highlighted button)
+- [x] **Task 4:** Integrate toolbar with existing tool system:
+  - [x] Toolbar clicks call `sketch_set_tool()`
+  - [x] Active tool highlighting in toolbar
+  - [x] Keyboard shortcuts still work (power users can use both)
+  - [ ] Tool tips on hover (optional - not implemented yet)
 
-**AI Agent Tasks:**
-- Research and recommend UI framework for Odin
-- Implement toolbar rendering and interaction
-- Create tool button system with icons
-- Integrate with existing sketch tool system
+**Bonus Features Implemented:**
+- [x] Properties panel showing entity details and editable parameters
+- [x] Feature tree panel showing parametric history with icons
+- [x] Status bar displaying current tool and entity counts
+- [x] Numeric stepper widget for extrude depth editing
+- [x] Panel layout system with proper spacing and styling
+- [x] Mouse-over detection to prevent 3D camera interference with UI
 
-**Deliverable:** Working toolbar with clickable tool buttons, replacing keyboard-only workflow
+**Implementation Details:**
+- **Files Created:**
+  - `/src/ui/widgets/widgets.odin` - Core UI framework (buttons, panels, text rendering)
+  - `/src/ui/widgets/cad_ui.odin` - CAD-specific panels (toolbar, properties, feature tree, status bar)
+- **Font Atlas:** 1024x1024 texture for fontstash (prevents reorganization corruption)
+- **Text Rendering:** Fixed UV coordinate sync issues and atlas reorganization bugs
+- **Integration:** Fully integrated with `main_gpu.odin` rendering pipeline
 
----
+**AI Agent Tasks:** ✅ All completed
+- ✅ Research and recommend UI framework for Odin → Custom immediate-mode UI chosen
+- ✅ Implement toolbar rendering and interaction → Fully working
+- ✅ Create tool button system with icons → Color-coded abbreviations implemented
+- ✅ Integrate with existing sketch tool system → Seamless integration complete
 
-### Week 12.5: Advanced UI & Tool Palette 🔜 PLANNED
-**Goal:** Professional tool palette with search, radial menus, and hover highlights
-
-**Tasks:**
-- [ ] **Task 1:** Tool palette with search:
-  - [ ] [S] shortcut → Pop up tool palette overlay
-  - [ ] Search input at top (type to filter tools)
-  - [ ] Categorized tool list (Sketch, 3D, Constraints, etc.)
-  - [ ] Favorite tools section (user-customizable)
-  - [ ] Recently used tools
-  - [ ] Click tool to activate and close palette
-- [ ] **Task 2:** Radial menu system:
-  - [ ] Context-aware radial menus (Sketch mode vs 3D mode)
-  - [ ] Radial menu for Solid tools (Extrude, Cut, Revolve, Fillet)
-  - [ ] Radial menu for Surface tools (placeholder for future)
-  - [ ] Radial menu for Sketch tools (Line, Circle, Arc, Dimension)
-  - [ ] Shortcut key to pop radial menu for current mode
-  - [ ] Mouse gesture or click to select tool
-- [ ] **Task 3:** Hover highlights:
-  - [ ] Detect mouse hover over points (hit testing with tolerance)
-  - [ ] Detect mouse hover over edges (distance to line/circle)
-  - [ ] Highlight hovered entities in different color (bright white/yellow)
-  - [ ] Show tooltip with entity info (Point #3, Line #5, etc.)
-  - [ ] Preview dimension value when hovering over constraints
-- [ ] **Task 4:** Closed shape visualization:
-  - [ ] Detect closed profiles in sketch (already have this in `profile.odin`)
-  - [ ] Shade closed shapes with subtle fill color (e.g., dark cyan at 20% opacity)
-  - [ ] Render fill behind wireframe
-  - [ ] Toggle shading on/off (view option)
-- [ ] **Task 5:** Line tool improvements:
-  - [ ] Detect when line tool closes a shape (start point == end point within threshold)
-  - [ ] Automatically exit line tool after closing shape (return to Select mode)
-  - [ ] Visual feedback when shape is about to close (highlight start point)
-  - [ ] Optional: Allow continue drawing in separate profile (user choice)
-
-**AI Agent Tasks:**
-- Implement tool palette overlay with search functionality
-- Create radial menu system with context awareness
-- Implement hover detection and highlighting for points/edges
-- Add closed shape shading with transparency
-- Improve line tool to auto-exit on shape closure
-
-**Deliverable:** Professional CAD UI with searchable tool palette, radial menus, hover highlights, and smart line tool behavior
+**Deliverable:** ✅ Working toolbar with clickable tool buttons, properties panel, feature tree, and status bar. Keyboard shortcuts and mouse clicks both work seamlessly.
 
 ---
+
+
 
 ## Updated Schedule
 
@@ -612,8 +585,8 @@ make run          # Still available for GLFW version (backup)
 
 ### Revised Timeline:
 - **Week 9:** ✅ COMPLETE - Extrude feature and parametric system
-- **Week 9.5:** 🔄 IN PROGRESS - Viewport aspect ratio & multi-touch input
-- **Week 9.6:** 🔄 IN PROGRESS - UI framework & toolbar
+- **Week 9.5:** ✅ COMPLETE - SDL3 GPU migration & multi-touch input
+- **Week 9.6:** ✅ COMPLETE - UI framework & toolbar
 - **Week 10:** → Renamed to **Week 10.5** (Boolean Operations)
 - **Week 12.5:** 🔜 PLANNED - Advanced UI (tool palette, radial menus, hover)
 - **Week 11-12:** → Continue as originally planned after UI improvements
@@ -691,6 +664,52 @@ make run          # Still available for GLFW version (backup)
 - Generate test models for validation
 
 **Deliverable:** Can export models to STL and apply basic fillets
+
+---
+
+### Week 12.5: Advanced UI & Tool Palette 🔜 PLANNED
+**Goal:** Professional tool palette with search, radial menus, and hover highlights
+
+**Tasks:**
+- [ ] **Task 1:** Tool palette with search:
+  - [ ] [S] shortcut → Pop up tool palette overlay
+  - [ ] Search input at top (type to filter tools)
+  - [ ] Categorized tool list (Sketch, 3D, Constraints, etc.)
+  - [ ] Favorite tools section (user-customizable)
+  - [ ] Recently used tools
+  - [ ] Click tool to activate and close palette
+- [ ] **Task 2:** Radial menu system:
+  - [ ] Context-aware radial menus (Sketch mode vs 3D mode)
+  - [ ] Radial menu for Solid tools (Extrude, Cut, Revolve, Fillet)
+  - [ ] Radial menu for Surface tools (placeholder for future)
+  - [ ] Radial menu for Sketch tools (Line, Circle, Arc, Dimension)
+  - [ ] Shortcut key to pop radial menu for current mode
+  - [ ] Mouse gesture or click to select tool
+- [ ] **Task 3:** Hover highlights:
+  - [ ] Detect mouse hover over points (hit testing with tolerance)
+  - [ ] Detect mouse hover over edges (distance to line/circle)
+  - [ ] Highlight hovered entities in different color (bright white/yellow)
+  - [ ] Show tooltip with entity info (Point #3, Line #5, etc.)
+  - [ ] Preview dimension value when hovering over constraints
+- [ ] **Task 4:** Closed shape visualization:
+  - [ ] Detect closed profiles in sketch (already have this in `profile.odin`)
+  - [ ] Shade closed shapes with subtle fill color (e.g., dark cyan at 20% opacity)
+  - [ ] Render fill behind wireframe
+  - [ ] Toggle shading on/off (view option)
+- [ ] **Task 5:** Line tool improvements:
+  - [ ] Detect when line tool closes a shape (start point == end point within threshold)
+  - [ ] Automatically exit line tool after closing shape (return to Select mode)
+  - [ ] Visual feedback when shape is about to close (highlight start point)
+  - [ ] Optional: Allow continue drawing in separate profile (user choice)
+
+**AI Agent Tasks:**
+- Implement tool palette overlay with search functionality
+- Create radial menu system with context awareness
+- Implement hover detection and highlighting for points/edges
+- Add closed shape shading with transparency
+- Improve line tool to auto-exit on shape closure
+
+**Deliverable:** Professional CAD UI with searchable tool palette, radial menus, hover highlights, and smart line tool behavior
 
 ---
 

@@ -102,9 +102,9 @@ fragment float4 text_fragment_main(
     texture2d<float> fontTexture [[texture(0)]],
     sampler textureSampler [[sampler(0)]]
 ) {
-    // Sample from font atlas (single channel R8)
+    // Sample from font atlas (R8_UNORM texture - single channel)
     float alpha = fontTexture.sample(textureSampler, in.texCoord).r;
 
-    // Return color with alpha from texture
+    // Return color with alpha from texture (simple and clean)
     return float4(in.color.rgb, in.color.a * alpha);
 }
