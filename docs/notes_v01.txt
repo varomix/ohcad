@@ -27,3 +27,4 @@ MISC notes
 - msaa / antialiasing
 - ✅ constraint icons
 - update viewport while scaling window
+- runtime optimization, is using a lot of cpu and gpu, what could it be

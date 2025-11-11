@@ -5,6 +5,8 @@ package ohcad_feature_tree
 import "core:fmt"
 import sketch "../../features/sketch"
 import extrude "../../features/extrude"
+import cut "../../features/cut"
+import revolve "../../features/revolve"
 import m "../../core/math"
 
 // Feature types
@@ -29,6 +31,8 @@ FeatureStatus :: enum {
 FeatureParams :: union {
     SketchParams,
     ExtrudeParams,
+    CutParams,
+    RevolveParams,
 }
 
 // Sketch feature parameters
@@ -42,6 +46,22 @@ ExtrudeParams :: struct {
     depth: f64,                            // Extrusion depth
     direction: extrude.ExtrudeDirection,   // Extrusion direction
     sketch_feature_id: int,                // ID of sketch to extrude
+}
+
+// Cut feature parameters
+CutParams :: struct {
+    depth: f64,                        // Cut depth
+    direction: cut.CutDirection,       // Cut direction
+    sketch_feature_id: int,            // ID of sketch to cut with
+    base_feature_id: int,              // ID of solid to cut from
+}
+
+// Revolve feature parameters
+RevolveParams :: struct {
+    angle: f64,                          // Revolution angle in degrees (0-360)
+    segments: int,                       // Number of rotation steps
+    axis_type: revolve.RevolveAxis,      // Which axis to revolve around
+    sketch_feature_id: int,              // ID of sketch to revolve
 }
 
 // Feature node - represents a single operation in the design history
@@ -106,7 +126,7 @@ feature_node_destroy :: proc(node: ^FeatureNode) {
     }
 
     // Clean up parameters
-    switch &params in node.params {
+    #partial switch &params in node.params {
     case SketchParams:
         // Sketch is owned by the feature
         if params.sketch_ref != nil {
@@ -116,6 +136,8 @@ feature_node_destroy :: proc(node: ^FeatureNode) {
         }
     case ExtrudeParams:
         // No cleanup needed for extrude params
+    case CutParams:
+        // No cleanup needed for cut params
     }
 }
 
@@ -199,6 +221,123 @@ feature_tree_add_extrude :: proc(
     return feature.id
 }
 
+// Add cut feature to tree
+feature_tree_add_cut :: proc(
+    tree: ^FeatureTree,
+    sketch_feature_id: int,
+    base_feature_id: int,
+    depth: f64,
+    direction: cut.CutDirection,
+    name: string,
+) -> int {
+
+    // Validate sketch feature exists
+    sketch_feature := feature_tree_get_feature(tree, sketch_feature_id)
+    if sketch_feature == nil {
+        fmt.printf("❌ Cannot add cut: sketch feature %d not found\n", sketch_feature_id)
+        return -1
+    }
+
+    if sketch_feature.type != .Sketch {
+        fmt.printf("❌ Cannot add cut: feature %d is not a sketch\n", sketch_feature_id)
+        return -1
+    }
+
+    // Validate base feature exists and has a solid
+    base_feature := feature_tree_get_feature(tree, base_feature_id)
+    if base_feature == nil {
+        fmt.printf("❌ Cannot add cut: base feature %d not found\n", base_feature_id)
+        return -1
+    }
+
+    if base_feature.result_solid == nil {
+        fmt.printf("❌ Cannot add cut: base feature %d has no solid\n", base_feature_id)
+        return -1
+    }
+
+    feature := FeatureNode{
+        id = tree.next_id,
+        type = .Cut,
+        name = name,
+        params = CutParams{
+            depth = depth,
+            direction = direction,
+            sketch_feature_id = sketch_feature_id,
+            base_feature_id = base_feature_id,
+        },
+        status = .NeedsUpdate,  // Needs initial generation
+        parent_features = make([dynamic]int),
+        result_solid = nil,
+        enabled = true,
+        visible = true,
+    }
+
+    // Add dependencies on sketch and base solid
+    append(&feature.parent_features, sketch_feature_id)
+    append(&feature.parent_features, base_feature_id)
+
+    tree.next_id += 1
+    append(&tree.features, feature)
+    tree.active_feature_id = feature.id
+
+    fmt.printf("✅ Added cut feature '%s' (ID=%d, parent_sketch=%d, base=%d)\n",
+        name, feature.id, sketch_feature_id, base_feature_id)
+
+    return feature.id
+}
+
+// Add revolve feature to tree
+feature_tree_add_revolve :: proc(
+    tree: ^FeatureTree,
+    sketch_feature_id: int,
+    angle: f64,
+    segments: int,
+    axis_type: revolve.RevolveAxis,
+    name: string,
+) -> int {
+
+    // Validate sketch feature exists
+    sketch_feature := feature_tree_get_feature(tree, sketch_feature_id)
+    if sketch_feature == nil {
+        fmt.printf("❌ Cannot add revolve: sketch feature %d not found\n", sketch_feature_id)
+        return -1
+    }
+
+    if sketch_feature.type != .Sketch {
+        fmt.printf("❌ Cannot add revolve: feature %d is not a sketch\n", sketch_feature_id)
+        return -1
+    }
+
+    feature := FeatureNode{
+        id = tree.next_id,
+        type = .Revolve,
+        name = name,
+        params = RevolveParams{
+            angle = angle,
+            segments = segments,
+            axis_type = axis_type,
+            sketch_feature_id = sketch_feature_id,
+        },
+        status = .NeedsUpdate,  // Needs initial generation
+        parent_features = make([dynamic]int),
+        result_solid = nil,
+        enabled = true,
+        visible = true,
+    }
+
+    // Add dependency on sketch
+    append(&feature.parent_features, sketch_feature_id)
+
+    tree.next_id += 1
+    append(&tree.features, feature)
+    tree.active_feature_id = feature.id
+
+    fmt.printf("✅ Added revolve feature '%s' (ID=%d, parent_sketch=%d, angle=%.1f°, segments=%d)\n",
+        name, feature.id, sketch_feature_id, angle, segments)
+
+    return feature.id
+}
+
 // =============================================================================
 // Feature Queries
 // =============================================================================
@@ -268,7 +407,13 @@ feature_regenerate :: proc(tree: ^FeatureTree, feature_id: int) -> bool {
     case .Extrude:
         return feature_regenerate_extrude(tree, feature)
 
-    case .Cut, .Revolve, .Fillet, .Chamfer:
+    case .Cut:
+        return feature_regenerate_cut(tree, feature)
+
+    case .Revolve:
+        return feature_regenerate_revolve(tree, feature)
+
+    case .Fillet, .Chamfer:
         fmt.println("❌ Feature type not yet implemented")
         feature.status = .Failed
         return false
@@ -332,6 +477,134 @@ feature_regenerate_extrude :: proc(tree: ^FeatureTree, feature: ^FeatureNode) ->
     return true
 }
 
+// Regenerate cut feature
+feature_regenerate_cut :: proc(tree: ^FeatureTree, feature: ^FeatureNode) -> bool {
+    params, ok := feature.params.(CutParams)
+    if !ok {
+        fmt.println("❌ Invalid cut parameters")
+        feature.status = .Failed
+        return false
+    }
+
+    // Get sketch feature
+    sketch_feature := feature_tree_get_feature(tree, params.sketch_feature_id)
+    if sketch_feature == nil {
+        fmt.printf("❌ Sketch feature %d not found\n", params.sketch_feature_id)
+        feature.status = .Failed
+        return false
+    }
+
+    // Get sketch data
+    sketch_params, sketch_ok := sketch_feature.params.(SketchParams)
+    if !sketch_ok || sketch_params.sketch_ref == nil {
+        fmt.println("❌ Invalid sketch reference")
+        feature.status = .Failed
+        return false
+    }
+
+    // Get base feature
+    base_feature := feature_tree_get_feature(tree, params.base_feature_id)
+    if base_feature == nil {
+        fmt.printf("❌ Base feature %d not found\n", params.base_feature_id)
+        feature.status = .Failed
+        return false
+    }
+
+    if base_feature.result_solid == nil {
+        fmt.printf("❌ Base feature %d has no solid\n", params.base_feature_id)
+        feature.status = .Failed
+        return false
+    }
+
+    // Clean up old result
+    if feature.result_solid != nil {
+        old_result := cut.CutResult{solid = feature.result_solid}
+        cut.cut_result_destroy(&old_result)
+        feature.result_solid = nil
+    }
+
+    // Perform cut
+    cut_params := cut.CutParams{
+        depth = params.depth,
+        direction = params.direction,
+        base_solid = base_feature.result_solid,
+    }
+
+    result := cut.cut_sketch(sketch_params.sketch_ref, cut_params)
+
+    if !result.success {
+        fmt.printf("❌ Cut failed: %s\n", result.message)
+        feature.status = .Failed
+        return false
+    }
+
+    // Store result
+    feature.result_solid = result.solid
+    feature.status = .Valid
+
+    fmt.printf("✅ Cut regenerated successfully\n")
+
+    return true
+}
+
+// Regenerate revolve feature
+feature_regenerate_revolve :: proc(tree: ^FeatureTree, feature: ^FeatureNode) -> bool {
+    params, ok := feature.params.(RevolveParams)
+    if !ok {
+        fmt.println("❌ Invalid revolve parameters")
+        feature.status = .Failed
+        return false
+    }
+
+    // Get sketch feature
+    sketch_feature := feature_tree_get_feature(tree, params.sketch_feature_id)
+    if sketch_feature == nil {
+        fmt.printf("❌ Sketch feature %d not found\n", params.sketch_feature_id)
+        feature.status = .Failed
+        return false
+    }
+
+    // Get sketch data
+    sketch_params, sketch_ok := sketch_feature.params.(SketchParams)
+    if !sketch_ok || sketch_params.sketch_ref == nil {
+        fmt.println("❌ Invalid sketch reference")
+        feature.status = .Failed
+        return false
+    }
+
+    // Clean up old result
+    if feature.result_solid != nil {
+        old_result := revolve.RevolveResult{solid = feature.result_solid}
+        revolve.revolve_result_destroy(&old_result)
+        feature.result_solid = nil
+    }
+
+    // Perform revolve
+    revolve_params := revolve.RevolveParams{
+        angle = params.angle,
+        segments = params.segments,
+        axis_type = params.axis_type,
+        axis_point = m.Vec3{0, 0, 0},  // Will be calculated from sketch plane
+        axis_dir = m.Vec3{0, 1, 0},    // Will be calculated from sketch plane
+    }
+
+    result := revolve.revolve_sketch(sketch_params.sketch_ref, revolve_params)
+
+    if !result.success {
+        fmt.printf("❌ Revolve failed: %s\n", result.message)
+        feature.status = .Failed
+        return false
+    }
+
+    // Store result
+    feature.result_solid = result.solid
+    feature.status = .Valid
+
+    fmt.printf("✅ Revolve regenerated successfully\n")
+
+    return true
+}
+
 // Regenerate all features in tree (in order)
 feature_tree_regenerate_all :: proc(tree: ^FeatureTree) -> bool {
     fmt.println("\n=== Regenerating All Features ===")
@@ -379,6 +652,102 @@ feature_tree_mark_dirty :: proc(tree: ^FeatureTree, feature_id: int) {
 }
 
 // =============================================================================
+// Feature Parameter Modification
+// =============================================================================
+
+// Change extrude depth
+change_extrude_depth :: proc(tree: ^FeatureTree, feature_id: int, new_depth: f64) -> bool {
+    feature := feature_tree_get_feature(tree, feature_id)
+    if feature == nil {
+        return false
+    }
+
+    if feature.type != .Extrude {
+        fmt.println("❌ Feature is not an extrude")
+        return false
+    }
+
+    params, ok := &feature.params.(ExtrudeParams)
+    if !ok {
+        return false
+    }
+
+    old_depth := params.depth
+    params.depth = new_depth
+
+    fmt.printf("📏 Changed extrude depth: %.3f → %.3f\n", old_depth, new_depth)
+
+    // Mark feature as needing update
+    feature_tree_mark_dirty(tree, feature_id)
+
+    return true
+}
+
+// Change cut depth
+change_cut_depth :: proc(tree: ^FeatureTree, feature_id: int, new_depth: f64) -> bool {
+    feature := feature_tree_get_feature(tree, feature_id)
+    if feature == nil {
+        return false
+    }
+
+    if feature.type != .Cut {
+        fmt.println("❌ Feature is not a cut")
+        return false
+    }
+
+    params, ok := &feature.params.(CutParams)
+    if !ok {
+        return false
+    }
+
+    old_depth := params.depth
+    params.depth = new_depth
+
+    fmt.printf("📏 Changed cut depth: %.3f → %.3f\n", old_depth, new_depth)
+
+    // Mark feature as needing update
+    feature_tree_mark_dirty(tree, feature_id)
+
+    return true
+}
+
+// Change revolve angle
+change_revolve_angle :: proc(tree: ^FeatureTree, feature_id: int, new_angle: f64) -> bool {
+    feature := feature_tree_get_feature(tree, feature_id)
+    if feature == nil {
+        return false
+    }
+
+    if feature.type != .Revolve {
+        fmt.println("❌ Feature is not a revolve")
+        return false
+    }
+
+    params, ok := &feature.params.(RevolveParams)
+    if !ok {
+        return false
+    }
+
+    old_angle := params.angle
+    params.angle = new_angle
+
+    // Clamp angle to valid range [1, 360]
+    if params.angle < 1.0 {
+        params.angle = 1.0
+    }
+    if params.angle > 360.0 {
+        params.angle = 360.0
+    }
+
+    fmt.printf("📐 Changed revolve angle: %.1f° → %.1f°\n", old_angle, params.angle)
+
+    // Mark feature as needing update
+    feature_tree_mark_dirty(tree, feature_id)
+
+    return true
+}
+
+// =============================================================================
 // Debugging & Display
 // =============================================================================
 
@@ -408,7 +777,7 @@ feature_tree_print :: proc(tree: ^FeatureTree) {
         }
 
         // Print type-specific info
-        switch params in feature.params {
+        #partial switch params in feature.params {
         case SketchParams:
             if params.sketch_ref != nil {
                 fmt.printf("      Points: %d, Entities: %d, Constraints: %d\n",
@@ -418,6 +787,14 @@ feature_tree_print :: proc(tree: ^FeatureTree) {
             }
         case ExtrudeParams:
             fmt.printf("      Depth: %.3f, Direction: %v\n", params.depth, params.direction)
+            if feature.result_solid != nil {
+                fmt.printf("      Result: %d vertices, %d edges\n",
+                    len(feature.result_solid.vertices),
+                    len(feature.result_solid.edges))
+            }
+        case CutParams:
+            fmt.printf("      Depth: %.3f, Direction: %v, Base: %d\n",
+                params.depth, params.direction, params.base_feature_id)
             if feature.result_solid != nil {
                 fmt.printf("      Result: %d vertices, %d edges\n",
                     len(feature.result_solid.vertices),

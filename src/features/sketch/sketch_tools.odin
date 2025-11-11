@@ -44,6 +44,8 @@ sketch_handle_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
 handle_line_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
     // Snap threshold - if clicking within 0.2 units of existing point, snap to it
     SNAP_THRESHOLD :: 0.2
+    // Auto-close threshold - if clicking within 0.15 units of start point, auto-close shape
+    AUTO_CLOSE_THRESHOLD :: 0.15
 
     if sketch.first_point_id == -1 {
         // First click - try to snap to existing point, or create new one
@@ -51,15 +53,41 @@ handle_line_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
 
         if found {
             sketch.first_point_id = snapped_id
+            sketch.chain_start_point_id = snapped_id  // Remember the original start point
             pt := sketch_get_point(sketch, snapped_id)
             fmt.printf("Line tool: Snapped to existing point %d at (%.3f, %.3f)\n", snapped_id, pt.x, pt.y)
         } else {
             sketch.first_point_id = sketch_add_point(sketch, click_pos.x, click_pos.y)
+            sketch.chain_start_point_id = sketch.first_point_id  // Remember the original start point
             fmt.printf("Line tool: Start point created at (%.3f, %.3f)\n", click_pos.x, click_pos.y)
         }
     } else {
-        // Second click - try to snap to existing point, or create new one
+        // Second+ click - try to snap to existing point, or create new one
         snapped_id, found := sketch_find_nearest_point(sketch, click_pos, SNAP_THRESHOLD)
+
+        // Check if we're close to the ORIGINAL start point (auto-close detection)
+        start_pt := sketch_get_point(sketch, sketch.chain_start_point_id)
+        if start_pt != nil {
+            start_pos := m.Vec2{start_pt.x, start_pt.y}
+            dist_to_start := glsl.length(click_pos - start_pos)
+
+            // Auto-close: If clicking near original start point, snap to it and close the shape
+            if dist_to_start < AUTO_CLOSE_THRESHOLD {
+                // Close the shape by connecting current endpoint to the original start point
+                sketch_add_line(sketch, sketch.first_point_id, sketch.chain_start_point_id)
+
+                fmt.println("✅ Shape closed! Auto-exiting line tool → Select tool")
+
+                // Reset line tool state
+                sketch.first_point_id = -1
+                sketch.chain_start_point_id = -1
+
+                // Auto-exit to Select tool
+                sketch.current_tool = .Select
+
+                return
+            }
+        }
 
         end_point_id: int
         if found {
@@ -80,7 +108,19 @@ handle_line_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
             sketch.first_point_id = end_point_id
             fmt.println("  → Continuing from endpoint (press ESC to finish)")
         } else {
-            fmt.println("Line tool: Cannot create line - start and end points are the same")
+            // Snapped back to a previous point - check if it's the original start
+            if end_point_id == sketch.chain_start_point_id {
+                fmt.println("✅ Shape closed! Auto-exiting line tool → Select tool")
+            } else {
+                fmt.println("✅ Connected to existing point! Auto-exiting line tool → Select tool")
+            }
+
+            // Reset line tool state
+            sketch.first_point_id = -1
+            sketch.chain_start_point_id = -1
+
+            // Auto-exit to Select tool
+            sketch.current_tool = .Select
         }
     }
 }

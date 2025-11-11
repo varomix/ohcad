@@ -96,6 +96,7 @@ Sketch2D :: struct {
     temp_point_valid: bool,      // Is temp point valid?
     first_point_id: int,         // First point in tool operations (-1 if none)
     second_point_id: int,        // Second point for dimension tool (-1 if none)
+    chain_start_point_id: int,   // Original start point of line chain (for auto-close detection)
 }
 
 // =============================================================================

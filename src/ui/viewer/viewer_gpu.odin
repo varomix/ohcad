@@ -19,6 +19,13 @@ import fs "vendor:fontstash"
 // Viewer Configuration
 // =============================================================================
 
+// Render mode for 3D solids
+RenderMode :: enum {
+    Wireframe,  // Lines only (edges)
+    Shaded,     // Solid triangles with lighting
+    Both,       // Wireframe + shaded combined
+}
+
 ViewerGPUConfig :: struct {
     window_width: i32,
     window_height: i32,
@@ -48,6 +55,11 @@ ViewerGPU :: struct {
     pipeline: ^sdl.GPUGraphicsPipeline,       // For line rendering
     triangle_pipeline: ^sdl.GPUGraphicsPipeline,  // For thick line rendering (quads)
 
+    // Shaded rendering pipeline (with lighting)
+    triangle_vertex_shader: ^sdl.GPUShader,
+    triangle_fragment_shader: ^sdl.GPUShader,
+    shaded_pipeline: ^sdl.GPUGraphicsPipeline,  // For shaded triangle rendering with lighting
+
     // Vertex buffers
     axes_vertex_buffer: ^sdl.GPUBuffer,
     axes_vertex_count: u32,
@@ -75,6 +87,7 @@ ViewerGPU :: struct {
     should_close: bool,
     window_width: u32,
     window_height: u32,
+    render_mode: RenderMode,  // Current rendering mode (wireframe/shaded/both)
 }
 
 // Touch point for multi-touch tracking
@@ -130,6 +143,122 @@ wireframe_mesh_gpu_add_edge_f64 :: proc(mesh: ^WireframeMeshGPU, v0, v1: m.Vec3)
     v0_f32 := [3]f32{f32(v0.x), f32(v0.y), f32(v0.z)}
     v1_f32 := [3]f32{f32(v1.x), f32(v1.y), f32(v1.z)}
     append(&mesh.edges, [2][3]f32{v0_f32, v1_f32})
+}
+
+// =============================================================================
+// Triangle Mesh (GPU version for shaded rendering)
+// =============================================================================
+
+// Triangle vertex structure (position + normal for lighting)
+TriangleVertex :: struct {
+    position: [3]f32,
+    normal: [3]f32,
+}
+
+// Triangle mesh data for SDL3 GPU rendering (with lighting)
+TriangleMeshGPU :: struct {
+    vertices: [dynamic]TriangleVertex,  // Triangle vertices with normals
+}
+
+// Create empty GPU triangle mesh
+triangle_mesh_gpu_init :: proc() -> TriangleMeshGPU {
+    return TriangleMeshGPU{
+        vertices = make([dynamic]TriangleVertex),
+    }
+}
+
+// Destroy GPU triangle mesh
+triangle_mesh_gpu_destroy :: proc(mesh: ^TriangleMeshGPU) {
+    delete(mesh.vertices)
+}
+
+// Clear all triangles from GPU triangle mesh
+triangle_mesh_gpu_clear :: proc(mesh: ^TriangleMeshGPU) {
+    clear(&mesh.vertices)
+}
+
+// Add triangle to GPU mesh (f64 version for compatibility)
+triangle_mesh_gpu_add_triangle :: proc(mesh: ^TriangleMeshGPU, v0, v1, v2, normal: m.Vec3) {
+    v0_f32 := [3]f32{f32(v0.x), f32(v0.y), f32(v0.z)}
+    v1_f32 := [3]f32{f32(v1.x), f32(v1.y), f32(v1.z)}
+    v2_f32 := [3]f32{f32(v2.x), f32(v2.y), f32(v2.z)}
+    normal_f32 := [3]f32{f32(normal.x), f32(normal.y), f32(normal.z)}
+
+    append(&mesh.vertices, TriangleVertex{v0_f32, normal_f32})
+    append(&mesh.vertices, TriangleVertex{v1_f32, normal_f32})
+    append(&mesh.vertices, TriangleVertex{v2_f32, normal_f32})
+}
+
+// Convert SimpleSolid to triangle mesh for shaded rendering (GPU version)
+solid_to_triangle_mesh_gpu :: proc(solid: ^extrude.SimpleSolid) -> TriangleMeshGPU {
+    mesh := triangle_mesh_gpu_init()
+
+    if solid == nil {
+        return mesh
+    }
+
+    // Add all triangles from solid
+    for tri in solid.triangles {
+        triangle_mesh_gpu_add_triangle(&mesh, tri.v0, tri.v1, tri.v2, tri.normal)
+    }
+
+    return mesh
+}
+
+// Create wireframe for a single sketch entity by index
+sketch_entity_to_wireframe_gpu :: proc(sk: ^sketch.Sketch2D, entity_index: int) -> WireframeMeshGPU {
+    mesh := wireframe_mesh_gpu_init()
+
+    if entity_index < 0 || entity_index >= len(sk.entities) {
+        return mesh
+    }
+
+    entity := sk.entities[entity_index]
+
+    switch e in entity {
+    case sketch.SketchLine:
+        start := sketch.sketch_get_point(sk, e.start_id)
+        end := sketch.sketch_get_point(sk, e.end_id)
+
+        if start != nil && end != nil {
+            start_2d := m.Vec2{start.x, start.y}
+            end_2d := m.Vec2{end.x, end.y}
+
+            start_3d := sketch.sketch_to_world(&sk.plane, start_2d)
+            end_3d := sketch.sketch_to_world(&sk.plane, end_2d)
+
+            wireframe_mesh_gpu_add_edge_f64(&mesh, start_3d, end_3d)
+        }
+
+    case sketch.SketchCircle:
+        center_pt := sketch.sketch_get_point(sk, e.center_id)
+        if center_pt != nil {
+            segments := 64
+            for i in 0..<segments {
+                angle0 := f64(i) * (2.0 * math.PI) / f64(segments)
+                angle1 := f64((i + 1) % segments) * (2.0 * math.PI) / f64(segments)
+
+                p0_2d := m.Vec2{
+                    center_pt.x + e.radius * math.cos(angle0),
+                    center_pt.y + e.radius * math.sin(angle0),
+                }
+                p1_2d := m.Vec2{
+                    center_pt.x + e.radius * math.cos(angle1),
+                    center_pt.y + e.radius * math.sin(angle1),
+                }
+
+                p0_3d := sketch.sketch_to_world(&sk.plane, p0_2d)
+                p1_3d := sketch.sketch_to_world(&sk.plane, p1_2d)
+
+                wireframe_mesh_gpu_add_edge_f64(&mesh, p0_3d, p1_3d)
+            }
+        }
+
+    case sketch.SketchArc:
+        // TODO: Arc rendering
+    }
+
+    return mesh
 }
 
 // =============================================================================
@@ -221,6 +350,7 @@ text_renderer_gpu_init :: proc(gpu_device: ^sdl.GPUDevice, window: ^sdl.Window, 
 
     // Load custom BigShoulders font from assets
     font_path := "assets/gui/fonts/BigShoulders_24pt-Regular.ttf"
+    // font_path := "assets/gui/fonts/Mohave-Regular.ttf"
     font_id := fs.AddFontPath(&renderer.font_context, "bigshoulders", font_path)
 
     if font_id == fs.INVALID {
@@ -372,10 +502,17 @@ text_renderer_gpu_init :: proc(gpu_device: ^sdl.GPUDevice, window: ^sdl.Window, 
             cull_mode = .NONE,
             front_face = .COUNTER_CLOCKWISE,
         },
+        depth_stencil_state = {
+            // Disable depth testing for UI - always render on top
+            enable_depth_test = false,
+            enable_depth_write = false,
+            enable_stencil_test = false,
+        },
         target_info = {
             num_color_targets = 1,
             color_target_descriptions = &color_target,
-            has_depth_stencil_target = false,
+            has_depth_stencil_target = true,  // Match render pass
+            depth_stencil_format = .D16_UNORM,
         },
     }
 
@@ -934,6 +1071,146 @@ viewer_gpu_render_sketch_points :: proc(
     sdl.BindGPUGraphicsPipeline(pass, viewer.pipeline)
 }
 
+// Render a single point with specified color and size
+viewer_gpu_render_single_point :: proc(
+    viewer: ^ViewerGPU,
+    cmd: ^sdl.GPUCommandBuffer,
+    pass: ^sdl.GPURenderPass,
+    sk: ^sketch.Sketch2D,
+    point: ^sketch.SketchPoint,
+    mvp: matrix[4,4]f32,
+    color: [4]f32,
+    point_size_pixels: f32,
+) {
+    // Calculate screen-space to world-space conversion
+    viewport_height := f32(viewer.window_height)
+    fov_radians := math.to_radians(viewer.camera.fov)
+    pixel_size_world := (2.0 * viewer.camera.distance * math.tan(fov_radians * 0.5)) / viewport_height
+
+    // Calculate radius in world units for the desired pixel size
+    radius := pixel_size_world * point_size_pixels
+
+    segments := 16  // Number of segments for smooth circle
+
+    // Generate triangle fan vertices for the point
+    circle_verts := make([dynamic]LineVertex, context.temp_allocator)
+
+    pt_2d := m.Vec2{point.x, point.y}
+    center_3d := sketch.sketch_to_world(&sk.plane, pt_2d)
+
+    // Center vertex
+    center_f32 := [3]f32{f32(center_3d.x), f32(center_3d.y), f32(center_3d.z)}
+
+    // Create triangle fan for filled circle
+    for i in 0..<segments {
+        angle0 := f64(i) * (2.0 * math.PI) / f64(segments)
+        angle1 := f64((i + 1) % segments) * (2.0 * math.PI) / f64(segments)
+
+        edge_2d_0 := m.Vec2{
+            point.x + f64(radius) * math.cos(angle0),
+            point.y + f64(radius) * math.sin(angle0),
+        }
+        edge_2d_1 := m.Vec2{
+            point.x + f64(radius) * math.cos(angle1),
+            point.y + f64(radius) * math.sin(angle1),
+        }
+
+        edge_3d_0 := sketch.sketch_to_world(&sk.plane, edge_2d_0)
+        edge_3d_1 := sketch.sketch_to_world(&sk.plane, edge_2d_1)
+
+        edge_f32_0 := [3]f32{f32(edge_3d_0.x), f32(edge_3d_0.y), f32(edge_3d_0.z)}
+        edge_f32_1 := [3]f32{f32(edge_3d_1.x), f32(edge_3d_1.y), f32(edge_3d_1.z)}
+
+        // Triangle: center, edge0, edge1
+        append(&circle_verts, LineVertex{center_f32})
+        append(&circle_verts, LineVertex{edge_f32_0})
+        append(&circle_verts, LineVertex{edge_f32_1})
+    }
+
+    if len(circle_verts) == 0 do return
+
+    // Create temporary vertex buffer
+    buffer_info := sdl.GPUBufferCreateInfo{
+        usage = {.VERTEX},
+        size = u32(len(circle_verts) * size_of(LineVertex)),
+    }
+
+    temp_vertex_buffer := sdl.CreateGPUBuffer(viewer.gpu_device, buffer_info)
+    if temp_vertex_buffer == nil {
+        fmt.eprintln("ERROR: Failed to create single point vertex buffer")
+        return
+    }
+    defer sdl.ReleaseGPUBuffer(viewer.gpu_device, temp_vertex_buffer)
+
+    // Upload vertex data via transfer buffer
+    transfer_info := sdl.GPUTransferBufferCreateInfo{
+        usage = .UPLOAD,
+        size = u32(len(circle_verts) * size_of(LineVertex)),
+    }
+
+    transfer_buffer := sdl.CreateGPUTransferBuffer(viewer.gpu_device, transfer_info)
+    if transfer_buffer == nil {
+        fmt.eprintln("ERROR: Failed to create transfer buffer for single point")
+        return
+    }
+    defer sdl.ReleaseGPUTransferBuffer(viewer.gpu_device, transfer_buffer)
+
+    // Map and copy vertex data
+    transfer_ptr := sdl.MapGPUTransferBuffer(viewer.gpu_device, transfer_buffer, false)
+    if transfer_ptr == nil {
+        fmt.eprintln("ERROR: Failed to map transfer buffer for single point")
+        return
+    }
+
+    dest_slice := ([^]LineVertex)(transfer_ptr)[:len(circle_verts)]
+    copy(dest_slice, circle_verts[:])
+    sdl.UnmapGPUTransferBuffer(viewer.gpu_device, transfer_buffer)
+
+    // Upload to GPU
+    upload_cmd := sdl.AcquireGPUCommandBuffer(viewer.gpu_device)
+    copy_pass := sdl.BeginGPUCopyPass(upload_cmd)
+
+    src := sdl.GPUTransferBufferLocation{
+        transfer_buffer = transfer_buffer,
+        offset = 0,
+    }
+
+    dst := sdl.GPUBufferRegion{
+        buffer = temp_vertex_buffer,
+        offset = 0,
+        size = u32(len(circle_verts) * size_of(LineVertex)),
+    }
+
+    sdl.UploadToGPUBuffer(copy_pass, src, dst, false)
+    sdl.EndGPUCopyPass(copy_pass)
+    _ = sdl.SubmitGPUCommandBuffer(upload_cmd)
+
+    // Wait for upload to complete
+    _ = sdl.WaitForGPUIdle(viewer.gpu_device)
+
+    // Switch to triangle pipeline
+    sdl.BindGPUGraphicsPipeline(pass, viewer.triangle_pipeline)
+
+    // Bind vertex buffer
+    binding := sdl.GPUBufferBinding{
+        buffer = temp_vertex_buffer,
+        offset = 0,
+    }
+    sdl.BindGPUVertexBuffers(pass, 0, &binding, 1)
+
+    // Draw point as filled circle
+    uniforms := Uniforms{
+        mvp = mvp,
+        color = color,
+    }
+    sdl.PushGPUVertexUniformData(cmd, 0, &uniforms, size_of(Uniforms))
+    sdl.PushGPUFragmentUniformData(cmd, 0, &uniforms, size_of(Uniforms))
+    sdl.DrawGPUPrimitives(pass, u32(len(circle_verts)), 1, 0, 0)
+
+    // Switch back to line pipeline
+    sdl.BindGPUGraphicsPipeline(pass, viewer.pipeline)
+}
+
 // =============================================================================
 // Preview Geometry Rendering
 // =============================================================================
@@ -984,6 +1261,22 @@ viewer_gpu_render_sketch_preview :: proc(
                 },
             }
             viewer_gpu_render_thick_lines(viewer, cmd, pass, preview_line, {0, 1, 1, 0.7}, mvp, 2.0)
+
+            // Visual feedback for auto-close: Highlight chain start point in yellow if cursor is near it
+            AUTO_CLOSE_THRESHOLD :: 0.15
+            if sk.chain_start_point_id != -1 {
+                chain_start_pt := sketch.sketch_get_point(sk, sk.chain_start_point_id)
+                if chain_start_pt != nil {
+                    chain_start_2d := m.Vec2{chain_start_pt.x, chain_start_pt.y}
+                    dist_to_start := glsl.length(sk.temp_point - chain_start_2d)
+
+                    // If cursor is near the chain start point, highlight it in yellow
+                    if dist_to_start < AUTO_CLOSE_THRESHOLD {
+                        // Render larger yellow point to indicate auto-close is available
+                        viewer_gpu_render_single_point(viewer, cmd, pass, sk, chain_start_pt, mvp, {1.0, 1.0, 0.0, 1.0}, 8.0)
+                    }
+                }
+            }
         }
     }
 
@@ -1506,21 +1799,42 @@ viewer_gpu_init :: proc(config: ViewerGPUConfig = DEFAULT_GPU_CONFIG) -> (^Viewe
 
     fmt.println("✓ Graphics pipeline created")
 
-    // Create triangle pipeline for thick lines (same shaders, different primitive type)
+    // Create triangle pipeline for thick lines and UI (same shaders, different primitive type)
+    // Enable alpha blending for transparency (profile fills)
+    triangle_color_target := sdl.GPUColorTargetDescription{
+        format = sdl.GetGPUSwapchainTextureFormat(gpu_device, window),
+        blend_state = {
+            enable_blend = true,
+            alpha_blend_op = .ADD,
+            color_blend_op = .ADD,
+            src_color_blendfactor = .SRC_ALPHA,
+            dst_color_blendfactor = .ONE_MINUS_SRC_ALPHA,
+            src_alpha_blendfactor = .ONE,
+            dst_alpha_blendfactor = .ONE_MINUS_SRC_ALPHA,
+        },
+    }
+
     triangle_pipeline_info := sdl.GPUGraphicsPipelineCreateInfo{
         vertex_shader = vertex_shader,
         fragment_shader = fragment_shader,
         vertex_input_state = vertex_input_state,
-        primitive_type = .TRIANGLELIST,  // For thick line quads
+        primitive_type = .TRIANGLELIST,  // For thick line quads and UI widgets
         rasterizer_state = {
             fill_mode = .FILL,
             cull_mode = .NONE,
             front_face = .COUNTER_CLOCKWISE,
         },
+        depth_stencil_state = {
+            // Disable depth testing for UI widgets - always render on top
+            enable_depth_test = false,
+            enable_depth_write = false,
+            enable_stencil_test = false,
+        },
         target_info = {
             num_color_targets = 1,
-            color_target_descriptions = &color_target,
-            has_depth_stencil_target = false,
+            color_target_descriptions = &triangle_color_target,
+            has_depth_stencil_target = true,  // Match render pass
+            depth_stencil_format = .D16_UNORM,
         },
     }
 
@@ -1538,8 +1852,129 @@ viewer_gpu_init :: proc(config: ViewerGPUConfig = DEFAULT_GPU_CONFIG) -> (^Viewe
 
     fmt.println("✓ Triangle pipeline created (for thick lines)")
 
-    // Create viewer
+    // Create viewer (will be assigned in branches below)
     viewer := new(ViewerGPU)
+    viewer.window = window
+    viewer.gpu_device = gpu_device
+    viewer.vertex_shader = vertex_shader
+    viewer.fragment_shader = fragment_shader
+    viewer.pipeline = pipeline
+    viewer.triangle_pipeline = triangle_pipeline
+
+    // Load triangle shaders for shaded rendering
+    triangle_shader_path := "src/ui/viewer/shaders/triangle_shader.metallib"
+    triangle_shader_data, triangle_shader_ok := os.read_entire_file(triangle_shader_path)
+    if !triangle_shader_ok {
+        fmt.eprintln("WARNING: Failed to read triangle shader, shaded rendering will be disabled:", triangle_shader_path)
+        // Continue without shaded rendering support
+        viewer.triangle_vertex_shader = nil
+        viewer.triangle_fragment_shader = nil
+        viewer.shaded_pipeline = nil
+    } else {
+        defer delete(triangle_shader_data)
+        fmt.printf("✓ Loaded triangle shaders: %s (%d bytes)\n", triangle_shader_path, len(triangle_shader_data))
+
+        // Create triangle vertex shader
+        tri_vertex_shader_info := sdl.GPUShaderCreateInfo{
+            code = raw_data(triangle_shader_data),
+            code_size = len(triangle_shader_data),
+            entrypoint = "triangle_vertex_main",
+            format = {.METALLIB},
+            stage = .VERTEX,
+            num_uniform_buffers = 1,
+        }
+
+        tri_vertex_shader := sdl.CreateGPUShader(gpu_device, tri_vertex_shader_info)
+        if tri_vertex_shader == nil {
+            fmt.eprintln("WARNING: Failed to create triangle vertex shader, shaded rendering disabled:", sdl.GetError())
+        }
+
+        // Create triangle fragment shader
+        tri_fragment_shader_info := sdl.GPUShaderCreateInfo{
+            code = raw_data(triangle_shader_data),
+            code_size = len(triangle_shader_data),
+            entrypoint = "triangle_fragment_main",
+            format = {.METALLIB},
+            stage = .FRAGMENT,
+            num_uniform_buffers = 1,
+        }
+
+        tri_fragment_shader := sdl.CreateGPUShader(gpu_device, tri_fragment_shader_info)
+        if tri_fragment_shader == nil {
+            fmt.eprintln("WARNING: Failed to create triangle fragment shader, shaded rendering disabled:", sdl.GetError())
+            if tri_vertex_shader != nil {
+                sdl.ReleaseGPUShader(gpu_device, tri_vertex_shader)
+            }
+        }
+
+        if tri_vertex_shader != nil && tri_fragment_shader != nil {
+            fmt.println("✓ Triangle shaders created")
+
+            // Create shaded rendering pipeline (for lit triangles)
+            tri_vertex_attributes := []sdl.GPUVertexAttribute{
+                {location = 0, format = .FLOAT3, offset = 0},  // position
+                {location = 1, format = .FLOAT3, offset = 12}, // normal
+            }
+
+            tri_vertex_binding := sdl.GPUVertexBufferDescription{
+                slot = 0,
+                pitch = size_of(TriangleVertex),
+                input_rate = .VERTEX,
+            }
+
+            tri_vertex_input_state := sdl.GPUVertexInputState{
+                vertex_buffer_descriptions = &tri_vertex_binding,
+                num_vertex_buffers = 1,
+                vertex_attributes = raw_data(tri_vertex_attributes),
+                num_vertex_attributes = u32(len(tri_vertex_attributes)),
+            }
+
+            shaded_pipeline_info := sdl.GPUGraphicsPipelineCreateInfo{
+                vertex_shader = tri_vertex_shader,
+                fragment_shader = tri_fragment_shader,
+                vertex_input_state = tri_vertex_input_state,
+                primitive_type = .TRIANGLELIST,
+                rasterizer_state = {
+                    fill_mode = .FILL,
+                    cull_mode = .NONE,  // Disable backface culling (for debugging normals)
+                    front_face = .COUNTER_CLOCKWISE,
+                },
+                depth_stencil_state = {
+                    compare_op = .LESS,  // Pass depth test if fragment is closer
+                    enable_depth_test = true,
+                    enable_depth_write = true,
+                    enable_stencil_test = false,
+                },
+                target_info = {
+                    num_color_targets = 1,
+                    color_target_descriptions = &color_target,
+                    has_depth_stencil_target = true,
+                    depth_stencil_format = .D16_UNORM,  // 16-bit depth buffer
+                },
+            }
+
+            shaded_pipeline := sdl.CreateGPUGraphicsPipeline(gpu_device, shaded_pipeline_info)
+            if shaded_pipeline == nil {
+                fmt.eprintln("WARNING: Failed to create shaded pipeline, shaded rendering disabled:", sdl.GetError())
+                sdl.ReleaseGPUShader(gpu_device, tri_fragment_shader)
+                sdl.ReleaseGPUShader(gpu_device, tri_vertex_shader)
+                viewer.triangle_vertex_shader = nil
+                viewer.triangle_fragment_shader = nil
+                viewer.shaded_pipeline = nil
+            } else {
+                fmt.println("✓ Shaded rendering pipeline created")
+                viewer.triangle_vertex_shader = tri_vertex_shader
+                viewer.triangle_fragment_shader = tri_fragment_shader
+                viewer.shaded_pipeline = shaded_pipeline
+            }
+        } else {
+            // Fall back to no shaded rendering
+            fmt.println("⚠ Shaded rendering will not be available")
+            viewer.triangle_vertex_shader = nil
+            viewer.triangle_fragment_shader = nil
+            viewer.shaded_pipeline = nil
+        }
+    }
     viewer.window = window
     viewer.gpu_device = gpu_device
     viewer.vertex_shader = vertex_shader
@@ -1549,6 +1984,7 @@ viewer_gpu_init :: proc(config: ViewerGPUConfig = DEFAULT_GPU_CONFIG) -> (^Viewe
     viewer.should_close = false
     viewer.window_width = u32(config.window_width)
     viewer.window_height = u32(config.window_height)
+    viewer.render_mode = .Wireframe  // Default to wireframe mode
 
     // Initialize camera
     aspect_ratio := f32(config.window_width) / f32(config.window_height)
@@ -2396,4 +2832,254 @@ viewer_gpu_render_wireframe :: proc(
 
     // Use thick line rendering for all edges
     viewer_gpu_render_thick_lines(viewer, cmd, pass, mesh.edges[:], color, mvp, thickness_pixels)
+}
+
+// =============================================================================
+// Triangle Mesh Rendering (Shaded with Lighting)
+// =============================================================================
+
+// Triangle uniforms structure (matches Metal shader TriangleUniforms)
+TriangleUniforms :: struct {
+    mvp: matrix[4,4]f32,          // Model-View-Projection matrix
+    model: matrix[4,4]f32,        // Model matrix (identity for now)
+    baseColor: [4]f32,            // Base material color
+    lightDir: [3]f32,             // Directional light direction
+    ambientStrength: f32,         // Ambient light strength
+}
+
+// Render triangle mesh with lighting (shaded mode)
+viewer_gpu_render_triangle_mesh :: proc(
+    viewer: ^ViewerGPU,
+    cmd: ^sdl.GPUCommandBuffer,
+    pass: ^sdl.GPURenderPass,
+    mesh: ^TriangleMeshGPU,
+    color: [4]f32,
+    mvp: matrix[4,4]f32,
+) {
+    if viewer.shaded_pipeline == nil {
+        return  // Shaded rendering not available
+    }
+
+    if len(mesh.vertices) == 0 {
+        return
+    }
+
+    // Create temporary vertex buffer for triangle mesh
+    buffer_info := sdl.GPUBufferCreateInfo{
+        usage = {.VERTEX},
+        size = u32(len(mesh.vertices) * size_of(TriangleVertex)),
+    }
+
+    temp_vertex_buffer := sdl.CreateGPUBuffer(viewer.gpu_device, buffer_info)
+    if temp_vertex_buffer == nil {
+        fmt.eprintln("ERROR: Failed to create triangle mesh vertex buffer")
+        return
+    }
+    defer sdl.ReleaseGPUBuffer(viewer.gpu_device, temp_vertex_buffer)
+
+    // Upload vertex data via transfer buffer
+    transfer_info := sdl.GPUTransferBufferCreateInfo{
+        usage = .UPLOAD,
+        size = u32(len(mesh.vertices) * size_of(TriangleVertex)),
+    }
+
+    transfer_buffer := sdl.CreateGPUTransferBuffer(viewer.gpu_device, transfer_info)
+    if transfer_buffer == nil {
+        fmt.eprintln("ERROR: Failed to create transfer buffer for triangle mesh")
+        return
+    }
+    defer sdl.ReleaseGPUTransferBuffer(viewer.gpu_device, transfer_buffer)
+
+    // Map and copy vertex data
+    transfer_ptr := sdl.MapGPUTransferBuffer(viewer.gpu_device, transfer_buffer, false)
+    if transfer_ptr == nil {
+        fmt.eprintln("ERROR: Failed to map transfer buffer for triangle mesh")
+        return
+    }
+
+    dest_slice := ([^]TriangleVertex)(transfer_ptr)[:len(mesh.vertices)]
+    copy(dest_slice, mesh.vertices[:])
+    sdl.UnmapGPUTransferBuffer(viewer.gpu_device, transfer_buffer)
+
+    // Upload to GPU
+    upload_cmd := sdl.AcquireGPUCommandBuffer(viewer.gpu_device)
+    copy_pass := sdl.BeginGPUCopyPass(upload_cmd)
+
+    src := sdl.GPUTransferBufferLocation{
+        transfer_buffer = transfer_buffer,
+        offset = 0,
+    }
+
+    dst := sdl.GPUBufferRegion{
+        buffer = temp_vertex_buffer,
+        offset = 0,
+        size = u32(len(mesh.vertices) * size_of(TriangleVertex)),
+    }
+
+    sdl.UploadToGPUBuffer(copy_pass, src, dst, false)
+    sdl.EndGPUCopyPass(copy_pass)
+    _ = sdl.SubmitGPUCommandBuffer(upload_cmd)
+
+    // Wait for upload to complete
+    _ = sdl.WaitForGPUIdle(viewer.gpu_device)
+
+    // Switch to shaded rendering pipeline
+    sdl.BindGPUGraphicsPipeline(pass, viewer.shaded_pipeline)
+
+    // Bind vertex buffer
+    binding := sdl.GPUBufferBinding{
+        buffer = temp_vertex_buffer,
+        offset = 0,
+    }
+    sdl.BindGPUVertexBuffers(pass, 0, &binding, 1)
+
+    // Set up lighting parameters
+    // Light direction: from upper-right-front (balanced for CAD viewing)
+    // The shader negates this, so this vector points FROM the light source
+    light_dir := [3]f32{-0.4, -0.5, -0.3}  // Gentle angle from upper-right-front
+    ambient_strength: f32 = 0.4            // 40% ambient light (ensures no pure black faces)
+
+    // Create identity matrix for model transform
+    model_matrix := matrix[4,4]f32{
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    }
+
+    tri_uniforms := TriangleUniforms{
+        mvp = mvp,
+        model = model_matrix,
+        baseColor = color,
+        lightDir = light_dir,
+        ambientStrength = ambient_strength,
+    }
+
+    // Push uniforms to shader
+    sdl.PushGPUVertexUniformData(cmd, 0, &tri_uniforms, size_of(TriangleUniforms))
+    sdl.PushGPUFragmentUniformData(cmd, 0, &tri_uniforms, size_of(TriangleUniforms))
+
+    // Draw triangles
+    sdl.DrawGPUPrimitives(pass, u32(len(mesh.vertices)), 1, 0, 0)
+
+    // Switch back to line pipeline
+    sdl.BindGPUGraphicsPipeline(pass, viewer.pipeline)
+}
+
+// Render highlighted face (filled polygon overlay)
+viewer_gpu_render_face_highlight :: proc(
+    viewer: ^ViewerGPU,
+    cmd: ^sdl.GPUCommandBuffer,
+    pass: ^sdl.GPURenderPass,
+    face: ^extrude.SimpleFace,
+    color: [4]f32,
+    mvp: matrix[4,4]f32,
+) {
+    if len(face.vertices) < 3 {
+        return
+    }
+
+    // Tessellate face into triangles (simple fan triangulation from first vertex)
+    // For now, assume faces are convex (which they are for extruded boxes)
+    triangle_vertices := make([dynamic]LineVertex, 0, (len(face.vertices) - 2) * 3)
+    defer delete(triangle_vertices)
+
+    // Triangle fan from first vertex
+    for i in 1..<len(face.vertices) - 1 {
+        v0 := face.vertices[0].position
+        v1 := face.vertices[i].position
+        v2 := face.vertices[i + 1].position
+
+        // Add triangle (v0, v1, v2) - convert f64 to f32
+        append(&triangle_vertices, LineVertex{position = {f32(v0.x), f32(v0.y), f32(v0.z)}})
+        append(&triangle_vertices, LineVertex{position = {f32(v1.x), f32(v1.y), f32(v1.z)}})
+        append(&triangle_vertices, LineVertex{position = {f32(v2.x), f32(v2.y), f32(v2.z)}})
+    }
+
+    if len(triangle_vertices) == 0 {
+        return
+    }
+
+    // Create vertex buffer for triangles
+    buffer_info := sdl.GPUBufferCreateInfo{
+        usage = {.VERTEX},
+        size = u32(len(triangle_vertices) * size_of(LineVertex)),
+    }
+
+    vertex_buffer := sdl.CreateGPUBuffer(viewer.gpu_device, buffer_info)
+    if vertex_buffer == nil {
+        fmt.eprintln("ERROR: Failed to create face highlight vertex buffer")
+        return
+    }
+    defer sdl.ReleaseGPUBuffer(viewer.gpu_device, vertex_buffer)
+
+    // Create transfer buffer
+    transfer_info := sdl.GPUTransferBufferCreateInfo{
+        usage = .UPLOAD,
+        size = u32(len(triangle_vertices) * size_of(LineVertex)),
+    }
+
+    transfer_buffer := sdl.CreateGPUTransferBuffer(viewer.gpu_device, transfer_info)
+    if transfer_buffer == nil {
+        fmt.eprintln("ERROR: Failed to create transfer buffer for face highlight")
+        return
+    }
+    defer sdl.ReleaseGPUTransferBuffer(viewer.gpu_device, transfer_buffer)
+
+    // Map and copy vertex data
+    transfer_ptr := sdl.MapGPUTransferBuffer(viewer.gpu_device, transfer_buffer, false)
+    if transfer_ptr == nil {
+        fmt.eprintln("ERROR: Failed to map transfer buffer for face highlight")
+        return
+    }
+
+    dest_slice := ([^]LineVertex)(transfer_ptr)[:len(triangle_vertices)]
+    copy(dest_slice, triangle_vertices[:])
+    sdl.UnmapGPUTransferBuffer(viewer.gpu_device, transfer_buffer)
+
+    // Upload to GPU
+    upload_cmd := sdl.AcquireGPUCommandBuffer(viewer.gpu_device)
+    copy_pass := sdl.BeginGPUCopyPass(upload_cmd)
+
+    upload_copy := sdl.GPUTransferBufferLocation{
+        transfer_buffer = transfer_buffer,
+        offset = 0,
+    }
+
+    destination := sdl.GPUBufferRegion{
+        buffer = vertex_buffer,
+        offset = 0,
+        size = u32(len(triangle_vertices) * size_of(LineVertex)),
+    }
+
+    sdl.UploadToGPUBuffer(copy_pass, upload_copy, destination, false)
+    sdl.EndGPUCopyPass(copy_pass)
+    _ = sdl.SubmitGPUCommandBuffer(upload_cmd)
+
+    // Wait for upload to complete
+    _ = sdl.WaitForGPUIdle(viewer.gpu_device)
+
+    // Bind triangle pipeline for filled face rendering
+    sdl.BindGPUGraphicsPipeline(pass, viewer.triangle_pipeline)
+
+    // Bind vertex buffer
+    buffer_binding := sdl.GPUBufferBinding{
+        buffer = vertex_buffer,
+        offset = 0,
+    }
+    sdl.BindGPUVertexBuffers(pass, 0, &buffer_binding, 1)
+
+    // Push MVP matrix and color
+    uniforms := Uniforms{
+        mvp = mvp,
+        color = color,
+    }
+    sdl.PushGPUVertexUniformData(cmd, 0, &uniforms, size_of(Uniforms))
+    sdl.PushGPUFragmentUniformData(cmd, 0, &uniforms, size_of(Uniforms))
+
+    // Draw triangles
+    sdl.DrawGPUPrimitives(pass, u32(len(triangle_vertices)), 1, 0, 0)
+
+    // Switch back to line pipeline
+    sdl.BindGPUGraphicsPipeline(pass, viewer.pipeline)
 }

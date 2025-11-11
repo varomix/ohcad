@@ -4,9 +4,9 @@ A focused Part-Design style CAD kernel and 2D technical drawing system implement
 
 ## Project Status
 
-🎉 **Week 9.6 Complete - UI Framework & Toolbar!** 🎉
+🎉 **Week 11.8 Complete - Undo/Redo System!** 🎉
 
-Working parametric 2D sketcher with constraint solving, 3D extrusion, and professional UI system!
+Working parametric CAD with full undo/redo, hover feedback, closed shape visualization, and professional UI!
 
 **Current Features:**
 - ✅ 2D parametric sketching (lines, circles, arcs)

@@ -34,7 +34,21 @@ Edge :: struct {
 sketch_detect_profiles :: proc(sketch: ^Sketch2D) -> [dynamic]Profile {
     profiles := make([dynamic]Profile, 0)
 
-    // Build connectivity graph
+    // First, detect standalone circles (they are closed profiles on their own)
+    for entity, idx in sketch.entities {
+        if circle, is_circle := entity.(SketchCircle); is_circle {
+            profile := Profile{
+                type = .Closed,
+                entities = make([dynamic]int, 1),
+                points = make([dynamic]int, 1),
+            }
+            profile.entities[0] = idx
+            profile.points[0] = circle.center_id  // Store center point ID
+            append(&profiles, profile)
+        }
+    }
+
+    // Build connectivity graph for line-based entities
     edges := build_edge_graph(sketch)
     defer delete(edges)
 
@@ -46,7 +60,7 @@ sketch_detect_profiles :: proc(sketch: ^Sketch2D) -> [dynamic]Profile {
     used_entities := make(map[int]bool)
     defer delete(used_entities)
 
-    // Find connected components
+    // Find connected components (line-based profiles)
     for edge, idx in edges {
         if used_entities[edge.entity_id] {
             continue

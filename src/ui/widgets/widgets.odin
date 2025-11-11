@@ -728,7 +728,7 @@ ui_tool_icon :: proc(
     }
 
     // Render icon text (centered, large font)
-    font_size := size * 0.35  // 35% of icon size for text
+    font_size := size * 0.65  // 65% of icon size for text
     text_width, text_height := ui_measure_text(ctx, icon_text, font_size)
     text_x := x + (size - text_width) * 0.5
     text_y := y + (size - text_height) * 0.5

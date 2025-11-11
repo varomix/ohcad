@@ -8,6 +8,7 @@ import sketch "../../features/sketch"
 import topo "../../core/topology"
 import m "../../core/math"
 import glsl "core:math/linalg/glsl"
+import tess "../../core/tessellation"
 
 // Extrude direction
 ExtrudeDirection :: enum {
@@ -33,10 +34,12 @@ ExtrudeResult :: struct {
 // Extrude Operation
 // =============================================================================
 
-// Simple solid structure (wireframe only for now)
+// Simple solid structure (wireframe + faces for selection + triangle mesh for rendering)
 SimpleSolid :: struct {
     vertices: [dynamic]^Vertex,
     edges: [dynamic]^Edge,
+    faces: [dynamic]SimpleFace,  // Face data for selection/sketching
+    triangles: [dynamic]Triangle3D,  // NEW: Triangle mesh for shaded rendering & STL export
 }
 
 // Simple vertex (world space)
@@ -47,6 +50,21 @@ Vertex :: struct {
 // Simple edge (connects two vertices)
 Edge :: struct {
     v0, v1: ^Vertex,
+}
+
+// Simple face (planar polygon for selection/sketching)
+SimpleFace :: struct {
+    vertices: [dynamic]^Vertex,  // Ordered vertices forming the face boundary
+    normal: m.Vec3,               // Face normal (pointing outward)
+    center: m.Vec3,               // Face center (for plane origin)
+    name: string,                 // Debug name (e.g., "Top", "Bottom", "Side0")
+}
+
+// Triangle3D - Single triangle for mesh rendering and STL export
+Triangle3D :: struct {
+    v0, v1, v2: m.Vec3,  // Triangle vertices in world space
+    normal: m.Vec3,       // Triangle normal (for flat shading)
+    face_id: int,         // Which face this triangle belongs to
 }
 
 // Extrude a sketch profile to create a 3D solid
@@ -113,8 +131,8 @@ extrude_profile :: proc(
     // Calculate extrusion vector
     extrude_offset := calculate_extrude_offset(&sk.plane, params)
 
-    // Get profile points in order
-    profile_points := get_profile_points_ordered(sk, profile)
+    // Get profile points in order (with tessellation for circles/arcs)
+    profile_points := get_profile_points_tessellated(sk, profile)
     defer delete(profile_points)
 
     if len(profile_points) < 3 {
@@ -178,10 +196,146 @@ extrude_profile :: proc(
         append(&solid.edges, edge)
     }
 
-    fmt.printf("✅ Created extruded solid: %d vertices, %d edges\n",
-        len(solid.vertices), len(solid.edges))
+    // NEW: Create faces for selection/sketching
+    solid.faces = make([dynamic]SimpleFace, 0, 2 + len(profile_points))
+
+    // Create bottom face
+    bottom_face := create_bottom_face(bottom_vertices[:], sk.plane.normal)
+    append(&solid.faces, bottom_face)
+
+    // Create top face
+    top_face := create_top_face(top_vertices[:], sk.plane.normal, extrude_offset)
+    append(&solid.faces, top_face)
+
+    // Create side faces (one for each edge of the profile)
+    for i in 0..<len(bottom_vertices) {
+        next_i := (i + 1) % len(bottom_vertices)
+        side_face := create_side_face(
+            bottom_vertices[i], bottom_vertices[next_i],
+            top_vertices[i], top_vertices[next_i],
+            i,
+        )
+        append(&solid.faces, side_face)
+    }
+
+    fmt.printf("✅ Created extruded solid: %d vertices, %d edges, %d faces\n",
+        len(solid.vertices), len(solid.edges), len(solid.faces))
+
+    // NEW: Generate triangle mesh for rendering
+    solid.triangles = generate_face_triangles(solid)
+    fmt.printf("✅ Generated %d triangles for shaded rendering\n", len(solid.triangles))
 
     return solid
+}
+
+// =============================================================================
+// Face Generation Helpers
+// =============================================================================
+
+// Create bottom face (on original sketch plane)
+create_bottom_face :: proc(vertices: []^Vertex, sketch_normal: m.Vec3) -> SimpleFace {
+    face: SimpleFace
+    face.vertices = make([dynamic]^Vertex, len(vertices))
+
+    // Bottom face normal points opposite to sketch normal
+    // Since we're flipping the normal, we must also reverse vertices to maintain winding
+    for i in 0..<len(vertices) {
+        face.vertices[len(vertices) - 1 - i] = vertices[i]
+    }
+
+    // Bottom face normal points outward (OPPOSITE to sketch normal - pointing down)
+    face.normal = -sketch_normal
+
+    // Calculate face center
+    face.center = calculate_face_center(face.vertices[:])
+
+    face.name = "Bottom"
+
+    // DEBUG: Print bottom face normal
+    fmt.printf("🔍 DEBUG Bottom Face: normal = (%.3f, %.3f, %.3f), center = (%.3f, %.3f, %.3f)\n",
+        face.normal.x, face.normal.y, face.normal.z,
+        face.center.x, face.center.y, face.center.z)
+
+    return face
+}
+
+// Create top face (offset from sketch plane)
+create_top_face :: proc(vertices: []^Vertex, sketch_normal: m.Vec3, extrude_offset: m.Vec3) -> SimpleFace {
+    face: SimpleFace
+    face.vertices = make([dynamic]^Vertex, len(vertices))
+
+    // Copy vertices in same order (assuming sketch profile is counter-clockwise)
+    for i in 0..<len(vertices) {
+        face.vertices[i] = vertices[i]
+    }
+
+    // Top face normal points outward (SAME as sketch normal - pointing up)
+    face.normal = sketch_normal
+
+    // Calculate face center
+    face.center = calculate_face_center(face.vertices[:])
+
+    face.name = "Top"
+
+    // DEBUG: Print top face normal
+    fmt.printf("🔍 DEBUG Top Face: normal = (%.3f, %.3f, %.3f), center = (%.3f, %.3f, %.3f)\n",
+        face.normal.x, face.normal.y, face.normal.z,
+        face.center.x, face.center.y, face.center.z)
+
+    return face
+}
+
+// Create side face (quad connecting bottom edge to top edge)
+create_side_face :: proc(
+    bottom_v0, bottom_v1: ^Vertex,
+    top_v0, top_v1: ^Vertex,
+    index: int,
+) -> SimpleFace {
+    face: SimpleFace
+    face.vertices = make([dynamic]^Vertex, 4)
+
+    // Quad vertices in order: bottom_v0, bottom_v1, top_v1, top_v0
+    // This creates a counter-clockwise winding when viewed from outside
+    face.vertices[0] = bottom_v0
+    face.vertices[1] = bottom_v1
+    face.vertices[2] = top_v1
+    face.vertices[3] = top_v0
+
+    // Calculate outward normal using cross product
+    // Edge 1: bottom_v0 -> bottom_v1 (along bottom edge)
+    // Edge 2: bottom_v0 -> top_v0 (vertical edge going up)
+    // Negate cross product to get outward-pointing normal
+    edge1 := bottom_v1.position - bottom_v0.position
+    edge2 := top_v0.position - bottom_v0.position
+    calculated_cross := glsl.cross(edge2, edge1)
+    face.normal = -glsl.normalize(calculated_cross)
+
+    // Calculate face center
+    face.center = calculate_face_center(face.vertices[:])
+
+    face.name = fmt.aprintf("Side%d", index)
+
+    // DEBUG: Print side face normal
+    fmt.printf("🔍 DEBUG Side%d Face: cross = (%.3f, %.3f, %.3f), normal = (%.3f, %.3f, %.3f)\n",
+        index,
+        calculated_cross.x, calculated_cross.y, calculated_cross.z,
+        face.normal.x, face.normal.y, face.normal.z)
+
+    return face
+}
+
+// Calculate center of a face (average of all vertices)
+calculate_face_center :: proc(vertices: []^Vertex) -> m.Vec3 {
+    if len(vertices) == 0 {
+        return m.Vec3{0, 0, 0}
+    }
+
+    sum := m.Vec3{0, 0, 0}
+    for vertex in vertices {
+        sum += vertex.position
+    }
+
+    return sum / f64(len(vertices))
 }
 
 // Calculate extrusion offset vector
@@ -212,6 +366,49 @@ get_profile_points_ordered :: proc(sk: ^sketch.Sketch2D, profile: sketch.Profile
 
     // Profile.points already contains the ordered point IDs
     // We just need to look up their coordinates
+    for point_id in profile.points {
+        if point_id >= 0 && point_id < len(sk.points) {
+            point := sk.points[point_id]
+            append(&points, m.Vec2{point.x, point.y})
+        }
+    }
+
+    return points
+}
+
+// Get profile points with tessellation for circles and arcs
+get_profile_points_tessellated :: proc(sk: ^sketch.Sketch2D, profile: sketch.Profile) -> [dynamic]m.Vec2 {
+    points := make([dynamic]m.Vec2, 0, 128)  // Reserve space for tessellation
+
+    // Check if profile contains only a single circle
+    if len(profile.entities) == 1 {
+        entity := sk.entities[profile.entities[0]]
+
+        // If it's a circle, tessellate it
+        if circle, is_circle := entity.(sketch.SketchCircle); is_circle {
+            // Get circle center from point ID
+            center := sketch.sketch_get_point(sk, circle.center_id)
+            if center == nil {
+                fmt.println("Error: Circle center point not found")
+                return points
+            }
+
+            tessellate_segments := 64  // Number of segments for circle
+
+            for i in 0..<tessellate_segments {
+                angle := f64(i) * 2.0 * 3.14159265359 / f64(tessellate_segments)
+                x := center.x + circle.radius * glsl.cos(angle)
+                y := center.y + circle.radius * glsl.sin(angle)
+                append(&points, m.Vec2{x, y})
+            }
+
+            fmt.printf("🔵 Tessellated circle into %d points\n", tessellate_segments)
+            return points
+        }
+    }
+
+    // For line-based profiles, use the existing point extraction
+    // Profile.points already contains the ordered point IDs
     for point_id in profile.points {
         if point_id >= 0 && point_id < len(sk.points) {
             point := sk.points[point_id]
@@ -258,4 +455,43 @@ extrude_result_destroy :: proc(result: ^ExtrudeResult) {
         free(result.solid)
         result.solid = nil
     }
+}
+
+// =============================================================================
+// Tessellation - Convert faces to triangle mesh
+// =============================================================================
+
+// Generate triangle mesh from all faces in the solid
+generate_face_triangles :: proc(solid: ^SimpleSolid) -> [dynamic]Triangle3D {
+    all_triangles := make([dynamic]Triangle3D, 0, len(solid.faces) * 2)
+
+    // Tessellate each face
+    for face, face_id in solid.faces {
+        // Convert Vertex pointers to Vec3 array
+        face_vertices := make([dynamic]m.Vec3, 0, len(face.vertices))
+        defer delete(face_vertices)
+
+        for vertex in face.vertices {
+            append(&face_vertices, vertex.position)
+        }
+
+        // Tessellate this face (returns FaceTri)
+        face_tris := tess.tessellate_face(face_vertices[:], face.normal, face_id)
+
+        // Convert FaceTri to Triangle3D
+        for ft in face_tris {
+            tri := Triangle3D {
+                v0 = ft.v0,
+                v1 = ft.v1,
+                v2 = ft.v2,
+                normal = ft.normal,
+                face_id = ft.face_id,
+            }
+            append(&all_triangles, tri)
+        }
+
+        delete(face_tris)
+    }
+
+    return all_triangles
 }

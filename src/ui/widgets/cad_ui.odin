@@ -22,9 +22,10 @@ CADUIState :: struct {
     properties_width: f32,
     feature_tree_width: f32,
 
-    // Extrude depth editing (for properties panel)
-    editing_extrude_depth: bool,
+    // Feature parameter editing (for properties panel)
     temp_extrude_depth: f32,
+    temp_revolve_angle: f32,
+    temp_cut_depth: f32,
 }
 
 cad_ui_state_init :: proc() -> CADUIState {
@@ -35,8 +36,9 @@ cad_ui_state_init :: proc() -> CADUIState {
         toolbar_width = 250,
         properties_width = 250,
         feature_tree_width = 250,
-        editing_extrude_depth = false,
         temp_extrude_depth = 1.0,
+        temp_revolve_angle = 360.0,
+        temp_cut_depth = 0.3,
     }
 }
 
@@ -51,6 +53,9 @@ ui_toolbar_panel :: proc(
     x, y, width: f32,
 ) -> f32 {
     if !cad_state.show_toolbar do return 0
+
+    // If no active sketch, don't show sketch tools
+    if sk == nil do return 0
 
     current_y := y
     spacing: f32 = 10
@@ -148,8 +153,8 @@ ui_properties_panel :: proc(
     )
     current_y += 50
 
-    // Show selected entity info
-    if sk.selected_entity >= 0 && sk.selected_entity < len(sk.entities) {
+    // Show selected entity info (if sketch exists)
+    if sk != nil && sk.selected_entity >= 0 && sk.selected_entity < len(sk.entities) {
         entity := sk.entities[sk.selected_entity]
 
         switch e in entity {
@@ -216,65 +221,184 @@ ui_properties_panel :: proc(
             current_y += widget_height + spacing
         }
     } else {
-        // No selection - show extrude properties if available
-        if extrude_feature_id >= 0 {
-            feature := ftree.feature_tree_get_feature(feature_tree, extrude_feature_id)
-            if feature != nil {
-                params, ok := feature.params.(ftree.ExtrudeParams)
-                if ok {
-                    ui_text_input(
-                        ctx,
-                        x + spacing, current_y,
-                        width - spacing * 2, widget_height,
-                        "FEATURE",
-                        "Extrude",
-                    )
-                    current_y += widget_height + spacing
+        // No selection - show most recent feature properties
+        last_feature: ^ftree.FeatureNode = nil
 
-                    // Editable extrude depth
-                    if ui_numeric_stepper(
-                        ctx,
-                        x + spacing, current_y,
-                        width - spacing * 2, widget_height,
-                        "DEPTH",
-                        &cad_state.temp_extrude_depth,
-                        0.1, 0.1, 10.0,
-                    ) {
-                        // Update extrude depth
-                        params.depth = f64(cad_state.temp_extrude_depth)
-                        feature.params = params
-                        ftree.feature_tree_mark_dirty(feature_tree, extrude_feature_id)
-                        needs_update = true
-                        fmt.printf("Extrude depth: %.2f\n", cad_state.temp_extrude_depth)
-                    }
-                    current_y += widget_height + spacing
+        // Find the most recent Extrude, Revolve, or Cut feature
+        for i := len(feature_tree.features) - 1; i >= 0; i -= 1 {
+            feature := &feature_tree.features[i]
+            if feature.type == .Extrude || feature.type == .Revolve || feature.type == .Cut {
+                last_feature = feature
+                break
+            }
+        }
 
-                    // Extrude direction
-                    direction_str := ""
-                    switch params.direction {
-                    case .Forward: direction_str = "Forward"
-                    case .Backward: direction_str = "Backward"
-                    case .Symmetric: direction_str = "Symmetric"
-                    }
+        if last_feature != nil {
+            // Initialize temp values from feature parameters
+            #partial switch params in last_feature.params {
+            case ftree.ExtrudeParams:
+                cad_state.temp_extrude_depth = f32(params.depth)
+            case ftree.RevolveParams:
+                cad_state.temp_revolve_angle = f32(params.angle)
+            case ftree.CutParams:
+                cad_state.temp_cut_depth = f32(params.depth)
+            }
 
-                    ui_text_input(
-                        ctx,
-                        x + spacing, current_y,
-                        width - spacing * 2, widget_height,
-                        "DIRECTION",
-                        direction_str,
-                    )
-                    current_y += widget_height + spacing
+            // Display properties based on feature type
+            #partial switch last_feature.type {
+            case .Extrude:
+                params := last_feature.params.(ftree.ExtrudeParams)
+
+                ui_text_input(
+                    ctx,
+                    x + spacing, current_y,
+                    width - spacing * 2, widget_height,
+                    "FEATURE",
+                    "Extrude",
+                )
+                current_y += widget_height + spacing
+
+                // Editable extrude depth with numeric stepper
+                if ui_numeric_stepper(
+                    ctx,
+                    x + spacing, current_y,
+                    width - spacing * 2, widget_height,
+                    "DEPTH",
+                    &cad_state.temp_extrude_depth,
+                    0.1, 0.1, 10.0,
+                ) {
+                    // Update extrude depth
+                    params.depth = f64(cad_state.temp_extrude_depth)
+                    last_feature.params = params
+                    ftree.feature_tree_mark_dirty(feature_tree, last_feature.id)
+                    needs_update = true
+                    fmt.printf("Extrude depth: %.2f\n", cad_state.temp_extrude_depth)
                 }
+                current_y += widget_height + spacing
+
+                // Extrude direction
+                direction_str := ""
+                switch params.direction {
+                case .Forward: direction_str = "Forward"
+                case .Backward: direction_str = "Backward"
+                case .Symmetric: direction_str = "Symmetric"
+                }
+
+                ui_text_input(
+                    ctx,
+                    x + spacing, current_y,
+                    width - spacing * 2, widget_height,
+                    "DIRECTION",
+                    direction_str,
+                )
+                current_y += widget_height + spacing
+
+            case .Revolve:
+                params := last_feature.params.(ftree.RevolveParams)
+
+                ui_text_input(
+                    ctx,
+                    x + spacing, current_y,
+                    width - spacing * 2, widget_height,
+                    "FEATURE",
+                    "Revolve",
+                )
+                current_y += widget_height + spacing
+
+                // Revolve angle with slider (0-360°)
+                // Show label
+                ui_text_input(
+                    ctx,
+                    x + spacing, current_y,
+                    width - spacing * 2, widget_height,
+                    "ANGLE",
+                    fmt.tprintf("%.0f°", cad_state.temp_revolve_angle),
+                )
+                current_y += widget_height + spacing
+
+                // Slider control
+                if ui_slider(
+                    ctx,
+                    x + spacing, current_y,
+                    width - spacing * 2, widget_height,
+                    &cad_state.temp_revolve_angle,
+                    1.0, 360.0,
+                ) {
+                    // Update revolve angle
+                    params.angle = f64(cad_state.temp_revolve_angle)
+                    last_feature.params = params
+                    ftree.feature_tree_mark_dirty(feature_tree, last_feature.id)
+                    needs_update = true
+                    fmt.printf("Revolve angle: %.0f°\n", cad_state.temp_revolve_angle)
+                }
+                current_y += widget_height + spacing
+
+                // Revolve axis type
+                axis_str := ""
+                switch params.axis_type {
+                case .SketchX: axis_str = "Sketch X-axis"
+                case .SketchY: axis_str = "Sketch Y-axis"
+                case .Custom: axis_str = "Custom"
+                }
+
+                ui_text_input(
+                    ctx,
+                    x + spacing, current_y,
+                    width - spacing * 2, widget_height,
+                    "AXIS",
+                    axis_str,
+                )
+                current_y += widget_height + spacing
+
+            case .Cut:
+                params := last_feature.params.(ftree.CutParams)
+
+                ui_text_input(
+                    ctx,
+                    x + spacing, current_y,
+                    width - spacing * 2, widget_height,
+                    "FEATURE",
+                    "Cut",
+                )
+                current_y += widget_height + spacing
+
+                // Editable cut depth with numeric stepper
+                if ui_numeric_stepper(
+                    ctx,
+                    x + spacing, current_y,
+                    width - spacing * 2, widget_height,
+                    "DEPTH",
+                    &cad_state.temp_cut_depth,
+                    0.1, 0.05, 5.0,
+                ) {
+                    // Update cut depth
+                    params.depth = f64(cad_state.temp_cut_depth)
+                    last_feature.params = params
+                    ftree.feature_tree_mark_dirty(feature_tree, last_feature.id)
+                    needs_update = true
+                    fmt.printf("Cut depth: %.2f\n", cad_state.temp_cut_depth)
+                }
+                current_y += widget_height + spacing
+
+            case:
+                // Other feature types
+                ui_text_input(
+                    ctx,
+                    x + spacing, current_y,
+                    width - spacing * 2, widget_height,
+                    "",
+                    "Feature properties unavailable",
+                )
+                current_y += widget_height + spacing
             }
         } else {
-            // Nothing selected
+            // No features to show
             ui_text_input(
                 ctx,
                 x + spacing, current_y,
                 width - spacing * 2, widget_height,
                 "",
-                "No selection",
+                "No features",
             )
             current_y += widget_height + spacing
         }
@@ -325,7 +449,13 @@ ui_feature_tree_panel :: proc(
         case .Extrude:
             icon_text = "EX"
             icon_color = {0, 255, 100, 255}  // Green
-        case .Cut, .Revolve, .Fillet, .Chamfer:
+        case .Revolve:
+            icon_text = "RV"
+            icon_color = {255, 150, 0, 255}  // Orange
+        case .Cut:
+            icon_text = "CT"
+            icon_color = {255, 100, 100, 255}  // Red
+        case .Fillet, .Chamfer:
             icon_text = "??"
             icon_color = {150, 150, 150, 255}  // Gray
         }
@@ -381,11 +511,77 @@ ui_feature_tree_panel :: proc(
 }
 
 // =============================================================================
+// Mode Indicator Banner - Prominent mode display at top
+// =============================================================================
+
+ui_mode_indicator_banner :: proc(
+    ctx: ^UIContext,
+    is_sketch_mode: bool,
+    sketch_name: string,
+    screen_width: u32,
+) {
+    banner_height: f32 = 50
+    banner_y: f32 = 0
+
+    // Background color based on mode
+    bg_color: [4]u8
+    if is_sketch_mode {
+        bg_color = {0, 100, 120, 255}  // Dark teal for Sketch Mode
+    } else {
+        bg_color = {40, 40, 50, 255}   // Dark gray for Solid Mode
+    }
+
+    ui_render_rect(ctx, 0, banner_y, f32(screen_width), banner_height, bg_color)
+
+    // Bottom border
+    border_color: [4]u8
+    if is_sketch_mode {
+        border_color = {0, 200, 255, 255}  // Bright cyan for Sketch Mode
+    } else {
+        border_color = {100, 100, 120, 255}  // Gray for Solid Mode
+    }
+
+    ui_render_rect(ctx, 0, banner_y + banner_height - 2, f32(screen_width), 2, border_color)
+
+    // Mode text
+    mode_text: string
+    if is_sketch_mode {
+        mode_text = "■ SKETCH MODE"
+    } else {
+        mode_text = "■ SOLID MODE"
+    }
+
+    text_x: f32 = 20
+    text_y := banner_y + 10
+
+    text_color: [4]u8
+    if is_sketch_mode {
+        text_color = {0, 255, 255, 255}  // Bright cyan for Sketch Mode
+    } else {
+        text_color = {150, 150, 170, 255}  // Light gray for Solid Mode
+    }
+
+    ui_render_text(ctx, mode_text, text_x, text_y, ctx.style.font_size_normal, text_color)
+
+    // Sketch name or instructions
+    info_text: string
+    if is_sketch_mode {
+        info_text = fmt.tprintf("Editing: %s  |  Press [ESC] to exit", sketch_name)
+    } else {
+        info_text = "Press [1] XY  [2] YZ  [3] XZ to create sketch  |  [E] Extrude  [T] Cut"
+    }
+
+    info_y := text_y + ctx.style.font_size_normal + 2
+    ui_render_text(ctx, info_text, text_x, info_y, ctx.style.font_size_small, ctx.style.text_secondary)
+}
+
+// =============================================================================
 // Status Bar - Bottom info bar
 // =============================================================================
 
 ui_status_bar :: proc(
     ctx: ^UIContext,
+    is_sketch_mode: bool,
     sk: ^sketch.Sketch2D,
     screen_width: u32,
     screen_height: u32,
@@ -399,22 +595,67 @@ ui_status_bar :: proc(
     // Top border
     ui_render_rect(ctx, 0, bar_y, f32(screen_width), 1, ctx.style.bg_light)
 
-    // Current tool
-    tool_name := ""
-    switch sk.current_tool {
-    case .Select: tool_name = "Select"
-    case .Line: tool_name = "Line"
-    case .Circle: tool_name = "Circle"
-    case .Arc: tool_name = "Arc"
-    case .Dimension: tool_name = "Dimension"
+    // Left padding for mode badge
+    badge_margin: f32 = 8
+    badge_x := badge_margin
+    badge_y := bar_y + 4
+    badge_height := bar_height - 8
+    badge_padding: f32 = 12
+
+    // Mode badge and status text based on mode
+    mode_text: string
+    badge_color: [4]u8
+    status_text: string
+
+    if is_sketch_mode && sk != nil {
+        // Sketch Mode: Cyan badge
+        mode_text = "SKETCH MODE"
+        badge_color = {0, 150, 180, 255}  // Cyan/Teal
+
+        // Show current tool and stats
+        tool_name := ""
+        switch sk.current_tool {
+        case .Select: tool_name = "Select"
+        case .Line: tool_name = "Line"
+        case .Circle: tool_name = "Circle"
+        case .Arc: tool_name = "Arc"
+        case .Dimension: tool_name = "Dimension"
+        }
+
+        status_text = fmt.tprintf("Tool: %s  |  Entities: %d  |  Constraints: %d  |  [L] Line [C] Circle [H] Horizontal [V] Vertical",
+            tool_name, len(sk.entities), len(sk.constraints))
+    } else {
+        // Solid Mode: Gray badge
+        mode_text = "SOLID MODE"
+        badge_color = {80, 85, 90, 255}  // Medium gray
+
+        // Show available operations
+        status_text = "[N] New Sketch  |  [E] Extrude  |  [T] Cut  |  [HOME] Reset View  |  [F] Feature Tree"
     }
 
-    status_text := fmt.tprintf("Tool: %s  |  Entities: %d  |  Constraints: %d",
-        tool_name, len(sk.entities), len(sk.constraints))
+    // Measure mode text to calculate badge width
+    mode_text_width, mode_text_height := ui_measure_text(ctx, mode_text, ctx.style.font_size_small)
+    badge_width := mode_text_width + badge_padding * 2
 
-    text_x: f32 = 10
-    text_y := bar_y + (bar_height - ctx.style.font_size_small) * 0.5
-    ui_render_text(ctx, status_text, text_x, text_y, ctx.style.font_size_small, ctx.style.text_secondary)
+    // Draw mode badge background
+    ui_render_rect(ctx, badge_x, badge_y, badge_width, badge_height, badge_color)
+
+    // Draw mode text (centered in badge)
+    mode_text_x := badge_x + badge_padding
+    mode_text_y := badge_y + (badge_height - mode_text_height) * 0.5
+    ui_render_text(ctx, mode_text, mode_text_x, mode_text_y, ctx.style.font_size_small, {255, 255, 255, 255})  // White text
+
+    // Draw separator after mode badge
+    separator_x := badge_x + badge_width + 12
+    separator_height: f32 = badge_height * 0.6
+    separator_y := badge_y + (badge_height - separator_height) * 0.5
+    separator_width: f32 = 1
+    ui_render_rect(ctx, separator_x, separator_y, separator_width, separator_height, ctx.style.bg_light)
+
+    // Draw status text after separator
+    status_x := separator_x + 12
+    status_y := bar_y + (bar_height - ctx.style.font_size_small) * 0.5
+    ui_render_text(ctx, status_text, status_x, status_y, ctx.style.font_size_small, ctx.style.text_secondary)
 }
 
 // =============================================================================
@@ -424,6 +665,7 @@ ui_status_bar :: proc(
 ui_cad_layout :: proc(
     ctx: ^UIContext,
     cad_state: ^CADUIState,
+    is_sketch_mode: bool,
     sk: ^sketch.Sketch2D,
     feature_tree: ^ftree.FeatureTree,
     extrude_feature_id: int,
@@ -432,8 +674,11 @@ ui_cad_layout :: proc(
 ) -> bool {
     needs_update := false
 
+    // Note: Mode indicator banner removed - status bar at bottom is sufficient
+    // ui_mode_indicator_banner function kept in code for future use if needed
+
     panel_x := f32(screen_width) - cad_state.toolbar_width - 20
-    panel_y: f32 = 20
+    panel_y: f32 = 20  // Standard top margin
 
     // Draw toolbar
     toolbar_height := ui_toolbar_panel(
@@ -471,7 +716,7 @@ ui_cad_layout :: proc(
     )
 
     // Draw status bar at bottom
-    ui_status_bar(ctx, sk, screen_width, screen_height)
+    ui_status_bar(ctx, is_sketch_mode, sk, screen_width, screen_height)
 
     return needs_update
 }
