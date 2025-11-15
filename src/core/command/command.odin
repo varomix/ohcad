@@ -60,15 +60,20 @@ command_history_destroy :: proc(history: ^CommandHistory) {
 
 // Execute a command and add it to history
 command_history_execute :: proc(history: ^CommandHistory, cmd: Command) -> bool {
-    // Execute the command
-    if !command_execute(cmd) {
+    // Make a mutable copy we can modify
+    modified_cmd := cmd
+
+    // Execute the command (returns modified command)
+    success, result_cmd := command_execute_and_return(modified_cmd)
+
+    if !success {
         fmt.println("❌ Command execution failed")
-        command_destroy(cmd)
+        command_destroy(result_cmd)
         return false
     }
 
-    // Add to undo stack
-    append(&history.undo_stack, cmd)
+    // Add the MODIFIED command to undo stack
+    append(&history.undo_stack, result_cmd)
 
     // Limit stack size
     if len(history.undo_stack) > history.max_history {
@@ -85,6 +90,45 @@ command_history_execute :: proc(history: ^CommandHistory, cmd: Command) -> bool 
     clear(&history.redo_stack)
 
     return true
+}
+
+// Execute and return modified command
+command_execute_and_return :: proc(cmd: Command) -> (bool, Command) {
+    modified_cmd := cmd
+
+    switch &c in &modified_cmd {
+    case AddPointCommand:
+        success := add_point_command_execute(&c)
+        return success, modified_cmd
+    case AddLineCommand:
+        success := add_line_command_execute(&c)
+        return success, modified_cmd
+    case AddCircleCommand:
+        success := add_circle_command_execute(&c)
+        return success, modified_cmd
+    case AddArcCommand:
+        success := add_arc_command_execute(&c)
+        return success, modified_cmd
+    case DeleteEntityCommand:
+        success := delete_entity_command_execute(&c)
+        return success, modified_cmd
+    case AddFeatureCommand:
+        success := add_feature_command_execute(&c)
+        return success, modified_cmd
+    case DeleteFeatureCommand:
+        success := delete_feature_command_execute(&c)
+        return success, modified_cmd
+    case ModifyFeatureCommand:
+        success := modify_feature_command_execute(c)
+        return success, modified_cmd
+    case AddConstraintCommand:
+        success := add_constraint_command_execute(&c)
+        return success, modified_cmd
+    case DeleteConstraintCommand:
+        success := delete_constraint_command_execute(&c)
+        return success, modified_cmd
+    }
+    return false, modified_cmd
 }
 
 // Undo the last command
@@ -167,27 +211,27 @@ command_history_get_redo_name :: proc(history: ^CommandHistory) -> string {
 
 // Execute a command
 command_execute :: proc(cmd: Command) -> bool {
-    switch c in cmd {
+    switch &c in cmd {
     case AddPointCommand:
-        return add_point_command_execute(c)
+        return add_point_command_execute(&c)
     case AddLineCommand:
-        return add_line_command_execute(c)
+        return add_line_command_execute(&c)
     case AddCircleCommand:
-        return add_circle_command_execute(c)
+        return add_circle_command_execute(&c)
     case AddArcCommand:
-        return add_arc_command_execute(c)
+        return add_arc_command_execute(&c)
     case DeleteEntityCommand:
-        return delete_entity_command_execute(c)
+        return delete_entity_command_execute(&c)
     case AddFeatureCommand:
-        return add_feature_command_execute(c)
+        return add_feature_command_execute(&c)
     case DeleteFeatureCommand:
-        return delete_feature_command_execute(c)
+        return delete_feature_command_execute(&c)
     case ModifyFeatureCommand:
         return modify_feature_command_execute(c)
     case AddConstraintCommand:
-        return add_constraint_command_execute(c)
+        return add_constraint_command_execute(&c)
     case DeleteConstraintCommand:
-        return delete_constraint_command_execute(c)
+        return delete_constraint_command_execute(&c)
     }
     return false
 }

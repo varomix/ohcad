@@ -13,6 +13,9 @@ HoverEntityType :: enum {
     Line,
     Circle,
     Arc,
+    Constraint,  // NEW: Hovering over a constraint (dimension text/icon)
+    RadiusHandle,  // NEW: Hovering over circle radius handle (Week 12.3 - Task 2)
+    LineEndpointHandle,  // NEW: Hovering over line endpoint handle (Week 12.3 - Task 3)
 }
 
 // Hover state - tracks what entity is currently hovered
@@ -20,6 +23,7 @@ HoverState :: struct {
     entity_type: HoverEntityType,
     entity_id: int,       // ID of the hovered entity (-1 if none)
     point_id: int,        // For points, or specific point on line/arc (-1 if none)
+    constraint_id: int,   // NEW: ID of hovered constraint (-1 if none)
     distance: f64,        // Distance from cursor to entity (for debugging)
 }
 
@@ -133,16 +137,306 @@ detect_hover_arc :: proc(sketch: ^Sketch2D, arc: SketchArc, cursor_pos: m.Vec2, 
     return in_range, dist_to_edge
 }
 
+// Detect hover for constraint (dimension/icon) under cursor
+detect_hover_constraint :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolerance: f64 = 0.25) -> (int, f64) {
+    if sketch.constraints == nil || len(sketch.constraints) == 0 {
+        return -1, 0.0
+    }
+
+    closest_id := -1
+    closest_dist := tolerance
+
+    for constraint in sketch.constraints {
+        if !constraint.enabled do continue
+
+        switch data in constraint.data {
+        case DistanceData:
+            // Check distance to dimension line
+            if data.point1_id < 0 || data.point1_id >= len(sketch.points) do continue
+            if data.point2_id < 0 || data.point2_id >= len(sketch.points) do continue
+
+            p1 := sketch_get_point(sketch, data.point1_id)
+            p2 := sketch_get_point(sketch, data.point2_id)
+            if p1 == nil || p2 == nil do continue
+
+            p1_2d := m.Vec2{p1.x, p1.y}
+            p2_2d := m.Vec2{p2.x, p2.y}
+
+            // Calculate dimension line position
+            edge_vec := p2_2d - p1_2d
+            edge_len := glsl.length(edge_vec)
+            if edge_len < 1e-10 do continue
+
+            edge_dir := edge_vec / edge_len
+            perp_dir := m.Vec2{-edge_dir.y, edge_dir.x}
+
+            mid := (p1_2d + p2_2d) * 0.5
+            to_offset := data.offset - mid
+            offset_distance := glsl.dot(to_offset, perp_dir)
+
+            MIN_OFFSET :: 0.3
+            if glsl.abs(offset_distance) < MIN_OFFSET {
+                offset_distance = MIN_OFFSET * glsl.sign(offset_distance)
+                if offset_distance == 0 {
+                    offset_distance = MIN_OFFSET
+                }
+            }
+
+            dim1_2d := p1_2d + perp_dir * offset_distance
+            dim2_2d := p2_2d + perp_dir * offset_distance
+
+            // Check distance to dimension line
+            dist := distance_point_to_line_segment(cursor_pos, dim1_2d, dim2_2d)
+
+            if dist < closest_dist {
+                closest_dist = dist
+                closest_id = constraint.id
+            }
+
+        case AngleData:
+            // Check distance to angular dimension arc
+            if data.line1_id < 0 || data.line1_id >= len(sketch.entities) do continue
+            if data.line2_id < 0 || data.line2_id >= len(sketch.entities) do continue
+
+            line1 := sketch.entities[data.line1_id].(SketchLine)
+            line2 := sketch.entities[data.line2_id].(SketchLine)
+
+            // Get line endpoints
+            p1_start := sketch_get_point(sketch, line1.start_id)
+            p1_end := sketch_get_point(sketch, line1.end_id)
+            p2_start := sketch_get_point(sketch, line2.start_id)
+            p2_end := sketch_get_point(sketch, line2.end_id)
+
+            if p1_start == nil || p1_end == nil || p2_start == nil || p2_end == nil do continue
+
+            // Check distance to arc or text position (use offset as approximation)
+            // For simplicity, check distance to the offset point (where the text is)
+            dist := glsl.length(cursor_pos - data.offset)
+
+            if dist < closest_dist {
+                closest_dist = dist
+                closest_id = constraint.id
+            }
+
+        case DistanceXData:
+            // Check distance to horizontal dimension line
+            if data.point1_id < 0 || data.point1_id >= len(sketch.points) do continue
+            if data.point2_id < 0 || data.point2_id >= len(sketch.points) do continue
+
+            p1 := sketch_get_point(sketch, data.point1_id)
+            p2 := sketch_get_point(sketch, data.point2_id)
+            if p1 == nil || p2 == nil do continue
+
+            // Horizontal dimension - dimension line is at offset.y, extends from p1.x to p2.x
+            dim_y := data.offset.y
+            dim1_2d := m.Vec2{p1.x, dim_y}
+            dim2_2d := m.Vec2{p2.x, dim_y}
+
+            // Check distance to dimension line
+            dist := distance_point_to_line_segment(cursor_pos, dim1_2d, dim2_2d)
+
+            if dist < closest_dist {
+                closest_dist = dist
+                closest_id = constraint.id
+            }
+
+        case DistanceYData:
+            // Check distance to vertical dimension line
+            if data.point1_id < 0 || data.point1_id >= len(sketch.points) do continue
+            if data.point2_id < 0 || data.point2_id >= len(sketch.points) do continue
+
+            p1 := sketch_get_point(sketch, data.point1_id)
+            p2 := sketch_get_point(sketch, data.point2_id)
+            if p1 == nil || p2 == nil do continue
+
+            // Vertical dimension - dimension line is at offset.x, extends from p1.y to p2.y
+            dim_x := data.offset.x
+            dim1_2d := m.Vec2{dim_x, p1.y}
+            dim2_2d := m.Vec2{dim_x, p2.y}
+
+            // Check distance to dimension line
+            dist := distance_point_to_line_segment(cursor_pos, dim1_2d, dim2_2d)
+
+            if dist < closest_dist {
+                closest_dist = dist
+                closest_id = constraint.id
+            }
+
+        case HorizontalData:
+            // Check distance to horizontal constraint icon
+            if data.line_id < 0 || data.line_id >= len(sketch.entities) do continue
+
+            entity := sketch.entities[data.line_id]
+            line, ok := entity.(SketchLine)
+            if !ok do continue
+
+            // Get line midpoint
+            p1 := sketch_get_point(sketch, line.start_id)
+            p2 := sketch_get_point(sketch, line.end_id)
+            if p1 == nil || p2 == nil do continue
+
+            mid_2d := m.Vec2{(p1.x + p2.x) * 0.5, (p1.y + p2.y) * 0.5}
+
+            // Icon is positioned above the line (matches rendering)
+            ICON_SIZE :: 0.15
+            icon_center := m.Vec2{mid_2d.x, mid_2d.y + ICON_SIZE * 1.5}
+
+            // Check distance to icon center (circular hit area)
+            dist := glsl.length(cursor_pos - icon_center)
+
+            if dist < closest_dist {
+                closest_dist = dist
+                closest_id = constraint.id
+            }
+
+        case VerticalData:
+            // Check distance to vertical constraint icon
+            if data.line_id < 0 || data.line_id >= len(sketch.entities) do continue
+
+            entity := sketch.entities[data.line_id]
+            line, ok := entity.(SketchLine)
+            if !ok do continue
+
+            // Get line midpoint
+            p1 := sketch_get_point(sketch, line.start_id)
+            p2 := sketch_get_point(sketch, line.end_id)
+            if p1 == nil || p2 == nil do continue
+
+            mid_2d := m.Vec2{(p1.x + p2.x) * 0.5, (p1.y + p2.y) * 0.5}
+
+            // Icon is positioned to the right of the line (matches rendering)
+            ICON_SIZE :: 0.15
+            icon_center := m.Vec2{mid_2d.x + ICON_SIZE * 1.5, mid_2d.y}
+
+            // Check distance to icon center (circular hit area)
+            dist := glsl.length(cursor_pos - icon_center)
+
+            if dist < closest_dist {
+                closest_dist = dist
+                closest_id = constraint.id
+            }
+
+        case CoincidentData, PerpendicularData, ParallelData, TangentData, EqualData,
+             PointOnLineData, PointOnCircleData, FixedPointData:
+            // Could add hit testing for other constraint types here
+            // For now, only distance, angular, horizontal, and vertical are clickable
+        }
+    }
+
+    return closest_id, closest_dist
+}
+
+// Detect hover for circle radius handle (Week 12.3 - Task 2)
+// Returns (entity_index, is_hovered, distance)
+detect_hover_radius_handle :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolerance: f64 = HOVER_TOLERANCE_POINT) -> (int, bool, f64) {
+    closest_id := -1
+    closest_dist := tolerance
+    found := false
+
+    // Only check selected circles (handle only visible on selected circles)
+    if sketch.selected_entity < 0 || sketch.selected_entity >= len(sketch.entities) {
+        return -1, false, 0.0
+    }
+
+    entity := sketch.entities[sketch.selected_entity]
+    circle, ok := entity.(SketchCircle)
+    if !ok {
+        return -1, false, 0.0
+    }
+
+    // Calculate radius handle position (on the right side of circle)
+    center_pt := sketch_get_point(sketch, circle.center_id)
+    if center_pt == nil {
+        return -1, false, 0.0
+    }
+
+    center_pos := m.Vec2{center_pt.x, center_pt.y}
+
+    // Radius handle is at the rightmost point of the circle (angle = 0)
+    handle_pos := m.Vec2{center_pos.x + circle.radius, center_pos.y}
+
+    // Check distance to handle
+    dist := glsl.length(cursor_pos - handle_pos)
+
+    if dist < tolerance {
+        return sketch.selected_entity, true, dist
+    }
+
+    return -1, false, dist
+}
+
+// Detect hover for line endpoint handles (Week 12.3 - Task 3)
+// Returns (entity_index, point_id, is_hovered, distance)
+detect_hover_line_endpoint_handle :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolerance: f64 = HOVER_TOLERANCE_POINT) -> (int, int, bool, f64) {
+    // Only check selected lines (handles only visible on selected lines)
+    if sketch.selected_entity < 0 || sketch.selected_entity >= len(sketch.entities) {
+        return -1, -1, false, 0.0
+    }
+
+    entity := sketch.entities[sketch.selected_entity]
+    line, ok := entity.(SketchLine)
+    if !ok {
+        return -1, -1, false, 0.0
+    }
+
+    // Get both endpoint positions
+    start_pt := sketch_get_point(sketch, line.start_id)
+    end_pt := sketch_get_point(sketch, line.end_id)
+    if start_pt == nil || end_pt == nil {
+        return -1, -1, false, 0.0
+    }
+
+    start_pos := m.Vec2{start_pt.x, start_pt.y}
+    end_pos := m.Vec2{end_pt.x, end_pt.y}
+
+    // Check distance to both endpoints
+    dist_to_start := glsl.length(cursor_pos - start_pos)
+    dist_to_end := glsl.length(cursor_pos - end_pos)
+
+    // Find closest endpoint
+    if dist_to_start < tolerance && dist_to_start <= dist_to_end {
+        // Hovering over start point
+        return sketch.selected_entity, line.start_id, true, dist_to_start
+    } else if dist_to_end < tolerance {
+        // Hovering over end point
+        return sketch.selected_entity, line.end_id, true, dist_to_end
+    }
+
+    return -1, -1, false, 0.0
+}
+
 // Update hover state based on cursor position
 sketch_update_hover :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2) -> HoverState {
     hover := HoverState{
         entity_type = .None,
         entity_id = -1,
         point_id = -1,
+        constraint_id = -1,
         distance = 0.0,
     }
 
-    // First check for point hover (highest priority - easier to select)
+    // First check for line endpoint handles (Week 12.3 - Task 3)
+    // This has highest priority when a line is selected
+    line_entity_id, endpoint_point_id, is_endpoint_hovered, endpoint_dist := detect_hover_line_endpoint_handle(sketch, cursor_pos)
+    if is_endpoint_hovered {
+        hover.entity_type = .LineEndpointHandle
+        hover.entity_id = line_entity_id // Line entity index
+        hover.point_id = endpoint_point_id // Which endpoint (start_id or end_id)
+        hover.distance = endpoint_dist
+        return hover
+    }
+
+    // Then check for radius handle hover (Week 12.3 - Task 2)
+    // This has high priority when a circle is selected
+    radius_handle_id, is_handle_hovered, handle_dist := detect_hover_radius_handle(sketch, cursor_pos)
+    if is_handle_hovered {
+        hover.entity_type = .RadiusHandle
+        hover.entity_id = radius_handle_id // Circle entity index
+        hover.distance = handle_dist
+        return hover
+    }
+
+    // Then check for point hover (high priority - easier to select)
     point_id, point_dist := detect_hover_point(sketch, cursor_pos)
     if point_id >= 0 {
         hover.entity_type = .Point
@@ -184,10 +478,19 @@ sketch_update_hover :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2) -> HoverState
         }
     }
 
-    if closest_edge_id >= 0 {
+    // Check for constraint hover (dimensions, icons, etc.)
+    constraint_id, constraint_dist := detect_hover_constraint(sketch, cursor_pos)
+
+    // Choose the closest between edge and constraint
+    // Edges have priority if they're closer
+    if closest_edge_id >= 0 && (constraint_id < 0 || closest_edge_dist < constraint_dist) {
         hover.entity_type = closest_edge_type
         hover.entity_id = closest_edge_id
         hover.distance = closest_edge_dist
+    } else if constraint_id >= 0 {
+        hover.entity_type = .Constraint
+        hover.constraint_id = constraint_id
+        hover.distance = constraint_dist
     }
 
     return hover
@@ -218,7 +521,7 @@ distance_point_to_line_segment :: proc(point, line_start, line_end: m.Vec2) -> f
 
 // Get hover info string for display
 get_hover_info :: proc(sketch: ^Sketch2D, hover: HoverState) -> string {
-    switch hover.entity_type {
+    #partial switch hover.entity_type {
     case .None:
         return ""
 

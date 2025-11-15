@@ -54,7 +54,7 @@ vertex TriangleVertexOut triangle_vertex_main(
 }
 
 // =============================================================================
-// Fragment Shader - Phong Lighting Model
+// Fragment Shader - Dual-Light Phong Model (for CAD viewing)
 // =============================================================================
 
 fragment float4 triangle_fragment_main(
@@ -64,16 +64,21 @@ fragment float4 triangle_fragment_main(
     // Normalize interpolated normal (can become denormalized during rasterization)
     float3 normal = normalize(in.normal);
 
-    // Ambient lighting
+    // Ambient lighting (base illumination for all surfaces)
     float3 ambient = uniforms.ambientStrength * uniforms.baseColor.rgb;
 
-    // Diffuse lighting (Lambertian reflectance)
-    float3 lightDir = normalize(-uniforms.lightDir);  // Light direction toward surface
-    float diffuseStrength = max(dot(normal, lightDir), 0.0);
-    float3 diffuse = diffuseStrength * uniforms.baseColor.rgb;
+    // Primary directional light (from upper-right-front)
+    float3 lightDir1 = normalize(-uniforms.lightDir);
+    float diffuseStrength1 = max(dot(normal, lightDir1), 0.0);
+    float3 diffuse1 = diffuseStrength1 * uniforms.baseColor.rgb * 0.6;  // 60% intensity
 
-    // Combine ambient + diffuse
-    float3 finalColor = ambient + diffuse;
+    // Secondary fill light (from opposite direction - lower-left-back)
+    float3 lightDir2 = -lightDir1;  // Opposite direction
+    float diffuseStrength2 = max(dot(normal, lightDir2), 0.0);
+    float3 diffuse2 = diffuseStrength2 * uniforms.baseColor.rgb * 0.4;  // 40% intensity
+
+    // Combine ambient + both diffuse lights
+    float3 finalColor = ambient + diffuse1 + diffuse2;
 
     // Return final color with alpha
     return float4(finalColor, uniforms.baseColor.a);

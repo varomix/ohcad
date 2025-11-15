@@ -304,22 +304,16 @@ create_side_face :: proc(
     // Calculate outward normal using cross product
     // Edge 1: bottom_v0 -> bottom_v1 (along bottom edge)
     // Edge 2: bottom_v0 -> top_v0 (vertical edge going up)
-    // Negate cross product to get outward-pointing normal
+    // Cross product: edge1 × edge2 gives outward-pointing normal
     edge1 := bottom_v1.position - bottom_v0.position
     edge2 := top_v0.position - bottom_v0.position
-    calculated_cross := glsl.cross(edge2, edge1)
-    face.normal = -glsl.normalize(calculated_cross)
+    calculated_cross := glsl.cross(edge1, edge2)
+    face.normal = glsl.normalize(calculated_cross)
 
     // Calculate face center
     face.center = calculate_face_center(face.vertices[:])
 
     face.name = fmt.aprintf("Side%d", index)
-
-    // DEBUG: Print side face normal
-    fmt.printf("🔍 DEBUG Side%d Face: cross = (%.3f, %.3f, %.3f), normal = (%.3f, %.3f, %.3f)\n",
-        index,
-        calculated_cross.x, calculated_cross.y, calculated_cross.z,
-        face.normal.x, face.normal.y, face.normal.z)
 
     return face
 }

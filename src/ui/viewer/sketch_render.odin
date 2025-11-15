@@ -316,7 +316,10 @@ render_sketch_constraints :: proc(shader: ^LineShader, sk: ^sketch.Sketch2D, mvp
         case sketch.EqualData:
             render_equal_icon(shader, sk, data, mvp, icon_size)
 
-        case sketch.AngleData, sketch.TangentData, sketch.PointOnLineData, sketch.PointOnCircleData, sketch.FixedPointData:
+        case sketch.AngleData:
+            render_angular_dimension(shader, sk, data, mvp, text_renderer, view, proj, viewport_width, viewport_height)
+
+        case sketch.TangentData, sketch.PointOnLineData, sketch.PointOnCircleData, sketch.FixedPointData:
             // These constraint types don't have visual indicators yet
             // Will be added in future iterations
         }
@@ -621,8 +624,8 @@ render_distance_dimension :: proc(shader: ^LineShader, sk: ^sketch.Sketch2D, dat
 			screen_x := (ndc.x + 1.0) * 0.5 * f32(viewport_width)
 			screen_y := (1.0 - ndc.y) * 0.5 * f32(viewport_height)  // Flip Y axis
 
-			// Format distance value as string
-			dist_text := fmt.tprintf("%.2f", data.distance)
+			// Format distance value as string (absolute value for display)
+			dist_text := fmt.tprintf("%.2f", math.abs(data.distance))
 
 			// Render text at screen position (bright yellow to match dimension line)
 			text_render_2d(text_renderer, dist_text, screen_x, screen_y, 16, {255, 255, 0, 255})
@@ -662,6 +665,201 @@ render_distance_x_dimension :: proc(shader: ^LineShader, sk: ^sketch.Sketch2D, d
     // Dimension line
     dim_verts := []m.Vec3{p1_dim_3d, p2_dim_3d}
     line_shader_draw(shader, dim_verts, {1.0, 1.0, 0.0, 1.0}, mvp, 2.5)  // Bright yellow, thicker
+}
+
+// Helper: Render angular dimension
+render_angular_dimension :: proc(shader: ^LineShader, sk: ^sketch.Sketch2D, data: sketch.AngleData, mvp: glsl.mat4, text_renderer: ^TextRenderer = nil, view: glsl.mat4 = {}, proj: glsl.mat4 = {}, viewport_width: i32 = 0, viewport_height: i32 = 0) {
+    if data.line1_id < 0 || data.line1_id >= len(sk.entities) do return
+    if data.line2_id < 0 || data.line2_id >= len(sk.entities) do return
+
+    entity1 := sk.entities[data.line1_id]
+    entity2 := sk.entities[data.line2_id]
+
+    line1, ok1 := entity1.(sketch.SketchLine)
+    line2, ok2 := entity2.(sketch.SketchLine)
+    if !ok1 || !ok2 do return
+
+    p1_start := sketch.sketch_get_point(sk, line1.start_id)
+    p1_end := sketch.sketch_get_point(sk, line1.end_id)
+    p2_start := sketch.sketch_get_point(sk, line2.start_id)
+    p2_end := sketch.sketch_get_point(sk, line2.end_id)
+
+    if p1_start == nil || p1_end == nil || p2_start == nil || p2_end == nil do return
+
+    p1_start_2d := m.Vec2{p1_start.x, p1_start.y}
+    p1_end_2d := m.Vec2{p1_end.x, p1_end.y}
+    p2_start_2d := m.Vec2{p2_start.x, p2_start.y}
+    p2_end_2d := m.Vec2{p2_end.x, p2_end.y}
+
+    // Find shared corner (intersection point)
+    center_2d: m.Vec2
+    EPSILON :: 0.001
+
+    if glsl.length(p1_start_2d - p2_start_2d) < EPSILON {
+        center_2d = p1_start_2d
+    } else if glsl.length(p1_start_2d - p2_end_2d) < EPSILON {
+        center_2d = p1_start_2d
+    } else if glsl.length(p1_end_2d - p2_start_2d) < EPSILON {
+        center_2d = p1_end_2d
+    } else if glsl.length(p1_end_2d - p2_end_2d) < EPSILON {
+        center_2d = p1_end_2d
+    } else {
+        return
+    }
+
+    // Calculate direction vectors from shared corner
+    v1 := p1_end_2d - p1_start_2d
+    v2 := p2_end_2d - p2_start_2d
+
+    len_v1 := glsl.length(v1)
+    len_v2 := glsl.length(v2)
+
+    if len_v1 < 1e-10 || len_v2 < 1e-10 do return
+
+    v1 = v1 / len_v1
+    v2 = v2 / len_v2
+
+    // Determine which direction each line points FROM the shared corner
+    v1_from_corner := v1
+    v2_from_corner := v2
+
+    dist_to_p1_start := glsl.length(center_2d - p1_start_2d)
+    dist_to_p1_end := glsl.length(center_2d - p1_end_2d)
+
+    if dist_to_p1_start < 0.001 {
+        v1_from_corner = v1
+    } else if dist_to_p1_end < 0.001 {
+        v1_from_corner = -v1
+    }
+
+    dist_to_p2_start := glsl.length(center_2d - p2_start_2d)
+    dist_to_p2_end := glsl.length(center_2d - p2_end_2d)
+
+    if dist_to_p2_start < 0.001 {
+        v2_from_corner = v2
+    } else if dist_to_p2_end < 0.001 {
+        v2_from_corner = -v2
+    }
+
+    // Calculate arc radius based on offset position
+    to_offset := data.offset - center_2d
+    radius := glsl.length(to_offset)
+
+    MIN_RADIUS :: 0.3
+    MAX_RADIUS :: 3.0
+    radius = glsl.clamp(radius, MIN_RADIUS, MAX_RADIUS)
+
+    // Calculate angles for the edge directions (same quadrant logic as preview)
+    a1 := math.atan2(f64(v1_from_corner.y), f64(v1_from_corner.x))
+    a2 := math.atan2(f64(v2_from_corner.y), f64(v2_from_corner.x))
+    a1_neg := a1 + math.PI
+    a2_neg := a2 + math.PI
+    a_cursor := math.atan2(f64(to_offset.y), f64(to_offset.x))
+
+    // Normalize all angles to [0, 2π]
+    normalize_angle :: proc(a: f64) -> f64 {
+        result := a
+        for result < 0 do result += 2.0 * math.PI
+        for result >= 2.0 * math.PI do result -= 2.0 * math.PI
+        return result
+    }
+
+    a1 = normalize_angle(a1)
+    a2 = normalize_angle(a2)
+    a1_neg = normalize_angle(a1_neg)
+    a2_neg = normalize_angle(a2_neg)
+    a_cursor = normalize_angle(a_cursor)
+
+    // Determine which pair of vectors to use for the arc
+    arc_start, arc_end: f64
+
+    // Test all 4 possible arcs - test if cursor is in CCW arc from start to end
+    {
+        sweep := a2 - a1
+        if sweep < 0 do sweep += 2.0 * math.PI
+        offset := a_cursor - a1
+        if offset < 0 do offset += 2.0 * math.PI
+        if offset <= sweep {
+            arc_start = a1
+            arc_end = a2
+        } else {
+            sweep2 := a1_neg - a2
+            if sweep2 < 0 do sweep2 += 2.0 * math.PI
+            offset2 := a_cursor - a2
+            if offset2 < 0 do offset2 += 2.0 * math.PI
+            if offset2 <= sweep2 {
+                arc_start = a2
+                arc_end = a1_neg
+            } else {
+                sweep3 := a2_neg - a1_neg
+                if sweep3 < 0 do sweep3 += 2.0 * math.PI
+                offset3 := a_cursor - a1_neg
+                if offset3 < 0 do offset3 += 2.0 * math.PI
+                if offset3 <= sweep3 {
+                    arc_start = a1_neg
+                    arc_end = a2_neg
+                } else {
+                    arc_start = a2_neg
+                    arc_end = a1
+                }
+            }
+        }
+    }
+
+    // Calculate CCW sweep angle
+    start_angle := arc_start
+    sweep_angle := arc_end - arc_start
+    if sweep_angle < 0 do sweep_angle += 2.0 * math.PI
+
+    // Tessellate arc into line segments (24 segments for smooth arc)
+    segments := 24
+    arc_verts := make([dynamic]m.Vec3, 0, segments * 2)
+    defer delete(arc_verts)
+
+    for i in 0..<segments {
+        t0 := f64(i) / f64(segments)
+        t1 := f64(i + 1) / f64(segments)
+
+        angle0 := start_angle + sweep_angle * t0
+        angle1 := start_angle + sweep_angle * t1
+
+        p0_2d := center_2d + m.Vec2{radius * math.cos(angle0), radius * math.sin(angle0)}
+        p1_2d := center_2d + m.Vec2{radius * math.cos(angle1), radius * math.sin(angle1)}
+
+        p0_3d := sketch.sketch_to_world(&sk.plane, p0_2d)
+        p1_3d := sketch.sketch_to_world(&sk.plane, p1_2d)
+
+        append(&arc_verts, p0_3d)
+        append(&arc_verts, p1_3d)
+    }
+
+    // Draw arc in bright yellow
+    line_shader_draw(shader, arc_verts[:], {1.0, 1.0, 0.0, 1.0}, mvp, 2.5)
+
+    // Render angle text value
+    if text_renderer != nil && viewport_width > 0 && viewport_height > 0 {
+        // Calculate midpoint of arc in 3D
+        mid_angle := start_angle + sweep_angle * 0.5
+        mid_radius := radius * 1.3
+        mid_2d := center_2d + m.Vec2{mid_radius * math.cos(mid_angle), mid_radius * math.sin(mid_angle)}
+        mid_3d := sketch.sketch_to_world(&sk.plane, mid_2d)
+
+        // Project 3D midpoint to screen space
+        clip_pos := proj * view * glsl.vec4{f32(mid_3d.x), f32(mid_3d.y), f32(mid_3d.z), 1.0}
+
+        if clip_pos.w != 0.0 {
+            ndc := clip_pos.xyz / clip_pos.w
+            screen_x := (ndc.x + 1.0) * 0.5 * f32(viewport_width)
+            screen_y := (1.0 - ndc.y) * 0.5 * f32(viewport_height)
+
+            // Format angle value as string (convert from radians to degrees)
+            angle_deg := sweep_angle * 180.0 / math.PI
+            angle_text := fmt.tprintf("%.1f°", angle_deg)
+
+            // Render text at screen position (bright yellow to match arc)
+            text_render_2d(text_renderer, angle_text, screen_x, screen_y, 16, {255, 255, 0, 255})
+        }
+    }
 }
 
 // =============================================================================

@@ -3,6 +3,7 @@ package widgets
 
 import "core:fmt"
 import "core:math"
+import doc "../../core/document"
 import sketch "../../features/sketch"
 import ftree "../../features/feature_tree"
 import extrude "../../features/extrude"
@@ -26,6 +27,7 @@ CADUIState :: struct {
     temp_extrude_depth: f32,
     temp_revolve_angle: f32,
     temp_cut_depth: f32,
+    temp_constraint_value: f32,  // For constraint editing
 }
 
 cad_ui_state_init :: proc() -> CADUIState {
@@ -133,6 +135,7 @@ ui_properties_panel :: proc(
     sk: ^sketch.Sketch2D,
     feature_tree: ^ftree.FeatureTree,
     extrude_feature_id: int,
+    document_settings: ^doc.DocumentSettings,  // NEW: Pass document settings for unit selection
     x, y, width: f32,
 ) -> (f32, bool) {
     if !cad_state.show_properties do return 0, false
@@ -154,8 +157,108 @@ ui_properties_panel :: proc(
     current_y += 50
 
     // Show selected entity info (if sketch exists)
-    if sk != nil && sk.selected_entity >= 0 && sk.selected_entity < len(sk.entities) {
-        entity := sk.entities[sk.selected_entity]
+    if sk != nil {
+        // Priority 1: Show selected constraint (if any)
+        if sk.selected_constraint_id >= 0 {
+            constraint := sketch.sketch_get_constraint(sk, sk.selected_constraint_id)
+            if constraint != nil {
+                // Constraint type
+                constraint_type_str := ""
+                #partial switch constraint.type {
+                case .Distance: constraint_type_str = "Distance"
+                case .DistanceX: constraint_type_str = "Distance X"
+                case .DistanceY: constraint_type_str = "Distance Y"
+                case .Horizontal: constraint_type_str = "Horizontal"
+                case .Vertical: constraint_type_str = "Vertical"
+                case .Angle: constraint_type_str = "Angle"
+                case .Perpendicular: constraint_type_str = "Perpendicular"
+                case .Parallel: constraint_type_str = "Parallel"
+                case .Coincident: constraint_type_str = "Coincident"
+                case .Equal: constraint_type_str = "Equal"
+                case .FixedPoint: constraint_type_str = "Fixed Point"
+                case .FixedDistance: constraint_type_str = "Fixed Distance"
+                case .FixedAngle: constraint_type_str = "Fixed Angle"
+                case: constraint_type_str = "Unknown"
+                }
+
+                ui_text_input(
+                    ctx,
+                    x + spacing, current_y,
+                    width - spacing * 2, widget_height,
+                    "TYPE",
+                    constraint_type_str,
+                )
+                current_y += widget_height + spacing
+
+                // Show editable value for numeric constraints
+                value, has_value := sketch.sketch_get_constraint_value(sk, sk.selected_constraint_id)
+                if has_value {
+                    // Use absolute value for DistanceX and DistanceY (since they use signed values internally)
+                    display_value := value
+                    if constraint.type == .DistanceX || constraint.type == .DistanceY {
+                        display_value = math.abs(value)
+                    }
+
+                    // Initialize temp value if needed
+                    if cad_state.temp_constraint_value == 0 {
+                        cad_state.temp_constraint_value = f32(display_value)
+                    }
+
+                    label := "VALUE"
+                    if constraint.type == .Angle || constraint.type == .FixedAngle {
+                        label = "ANGLE"
+                    } else {
+                        label = "DISTANCE"
+                    }
+
+                    if ui_numeric_stepper(
+                        ctx,
+                        x + spacing, current_y,
+                        width - spacing * 2, widget_height,
+                        label,
+                        &cad_state.temp_constraint_value,
+                        0.1, 0.1, 999.0,
+                    ) {
+                        // Update constraint value
+                        if sketch.sketch_modify_constraint_value(sk, sk.selected_constraint_id, f64(cad_state.temp_constraint_value)) {
+                            // Re-solve constraints after modification
+                            result := sketch.sketch_solve_constraints(sk)
+                            if result.status == .Success {
+                                fmt.printf("✓ Constraint value updated: %.2f (solver converged)\n", cad_state.temp_constraint_value)
+                                needs_update = true
+                            } else {
+                                fmt.printf("⚠️  Constraint value updated: %.2f (solver: %v)\n", cad_state.temp_constraint_value, result.status)
+                                needs_update = true  // Still update display even if solver didn't converge
+                            }
+                        } else {
+                            fmt.printf("❌ Failed to update constraint value\n")
+                        }
+                    }
+                    current_y += widget_height + spacing
+                }
+
+                // Delete constraint button
+                if ui_button(
+                    ctx,
+                    x + spacing, current_y,
+                    width - spacing * 2, widget_height,
+                    "Delete Constraint",
+                    {220, 50, 50, 255},  // Red
+                    {255, 80, 80, 255},
+                ) {
+                    // Delete the constraint
+                    if sketch.sketch_remove_constraint(sk, sk.selected_constraint_id) {
+                        sketch.sketch_deselect_constraint(sk)
+                        cad_state.temp_constraint_value = 0
+                        needs_update = true
+                        fmt.printf("✓ Constraint deleted\n")
+                    }
+                }
+                current_y += widget_height + spacing
+            }
+        } else if sk.selected_entity >= 0 && sk.selected_entity < len(sk.entities) {
+            // Priority 2: Show selected entity
+            entity := sk.entities[sk.selected_entity]
 
         switch e in entity {
         case sketch.SketchLine:
@@ -220,8 +323,42 @@ ui_properties_panel :: proc(
             )
             current_y += widget_height + spacing
         }
+        }
     } else {
-        // No selection - show most recent feature properties
+        // No selection - show document settings and most recent feature properties
+
+        // Section 1: Document Settings (Unit Selection)
+        ui_text_input(
+            ctx,
+            x + spacing, current_y,
+            width - spacing * 2, widget_height,
+            "",
+            "DOCUMENT",
+        )
+        current_y += widget_height + spacing
+
+        // Unit selection dropdown (for now, using button to toggle)
+        unit_text := doc.unit_name(document_settings.units)
+
+        if ui_button(
+            ctx,
+            x + spacing, current_y,
+            width - spacing * 2, widget_height,
+            fmt.tprintf("UNITS: %s", unit_text),
+            {80, 120, 180, 255},  // Blue
+            {100, 150, 220, 255},
+        ) {
+            // Toggle between millimeters and inches
+            if document_settings.units == .Millimeters {
+                doc.document_settings_set_units(document_settings, .Inches)
+            } else {
+                doc.document_settings_set_units(document_settings, .Millimeters)
+            }
+            needs_update = true
+        }
+        current_y += widget_height + spacing * 2  // Extra spacing before feature properties
+
+        // Section 2: Last Feature Properties (if any)
         last_feature: ^ftree.FeatureNode = nil
 
         // Find the most recent Extrude, Revolve, or Cut feature
@@ -408,20 +545,28 @@ ui_properties_panel :: proc(
 }
 
 // =============================================================================
-// Feature Tree Panel - Parametric History
+// Feature Tree Panel - Shows parametric history with double-click support
 // =============================================================================
+
+// Result from feature tree interaction
+FeatureTreeInteraction :: struct {
+    clicked_feature_id: int,  // -1 if no click, feature ID if clicked
+    double_clicked: bool,      // true if double-click detected
+}
 
 ui_feature_tree_panel :: proc(
     ctx: ^UIContext,
     cad_state: ^CADUIState,
     feature_tree: ^ftree.FeatureTree,
     x, y, width: f32,
-) -> f32 {
-    if !cad_state.show_feature_tree do return 0
-
-    current_y := y
+    editing_feature_id: int,  // NEW: ID of feature currently being edited (-1 if none)
+) -> (height: f32, interaction: FeatureTreeInteraction) {
     spacing: f32 = 10
+    current_y := y
     item_height: f32 = 28
+
+    // Initialize interaction result
+    interaction = FeatureTreeInteraction{clicked_feature_id = -1, double_clicked = false}
 
     // Section: FEATURE TREE
     ui_section_box(
@@ -460,14 +605,31 @@ ui_feature_tree_panel :: proc(
             icon_color = {150, 150, 150, 255}  // Gray
         }
 
+        // Check if this feature is being edited
+        is_editing := (editing_feature_id == feature.id)
+
         // Draw feature item as a button-like widget
         is_hot := ui_point_in_rect(ctx.mouse_x, ctx.mouse_y, x + spacing, current_y, width - spacing * 2, item_height)
 
         if is_hot {
             ctx.mouse_over_ui = true
+
+            // Detect click on this feature (only on mouse button DOWN transition)
+            if !ctx.mouse_down_prev && ctx.mouse_down {
+                interaction.clicked_feature_id = feature.id
+            }
         }
 
-        bg_color := is_hot ? ctx.style.bg_medium : ctx.style.bg_dark
+        // Background color: yellow if editing, highlight if hovering, dark otherwise
+        bg_color: [4]u8
+        if is_editing {
+            bg_color = {100, 100, 0, 255}  // Dark yellow for editing
+        } else if is_hot {
+            bg_color = ctx.style.bg_medium
+        } else {
+            bg_color = ctx.style.bg_dark
+        }
+
         ui_render_rect(ctx, x + spacing, current_y, width - spacing * 2, item_height, bg_color)
 
         // Border
@@ -478,23 +640,64 @@ ui_feature_tree_panel :: proc(
         ui_render_rect(ctx, x + spacing, current_y, border_width, item_height, border_color)
         ui_render_rect(ctx, x + spacing + width - spacing * 2 - border_width, current_y, border_width, item_height, border_color)
 
-        // Icon
+        // Icon (with editing indicator)
         icon_size: f32 = 24
         icon_x := x + spacing + 4
         icon_y := current_y + (item_height - icon_size) * 0.5
 
         ui_render_rect(ctx, icon_x, icon_y, icon_size, icon_size, ctx.style.bg_medium)
 
-        // Icon text
-        icon_text_width, icon_text_height := ui_measure_text(ctx, icon_text, ctx.style.font_size_small)
+        // Icon text - show "✏️" if editing, otherwise show feature type
+        display_icon := is_editing ? "ED" : icon_text  // "ED" for "Editing"
+        display_color := is_editing ? [4]u8{255, 255, 0, 255} : icon_color  // Yellow if editing
+
+        icon_text_width, icon_text_height := ui_measure_text(ctx, display_icon, ctx.style.font_size_small)
         icon_text_x := icon_x + (icon_size - icon_text_width) * 0.5
         icon_text_y := icon_y + (icon_size - icon_text_height) * 0.5
-        ui_render_text(ctx, icon_text, icon_text_x, icon_text_y, ctx.style.font_size_small, icon_color)
+        ui_render_text(ctx, display_icon, icon_text_x, icon_text_y, ctx.style.font_size_small, display_color)
 
         // Feature name
         name_x := icon_x + icon_size + 8
         name_y := current_y + (item_height - ctx.style.font_size_small) * 0.5
         ui_render_text(ctx, feature.name, name_x, name_y, ctx.style.font_size_small, ctx.style.text_primary)
+
+        // Checkmark button (✓) for finishing sketch edit (only show when editing)
+        if is_editing && feature.type == .Sketch {
+            checkmark_size: f32 = 20
+            checkmark_x := x + width - spacing - checkmark_size - 40  // Position before visibility indicator
+            checkmark_y := current_y + (item_height - checkmark_size) * 0.5
+
+            // Check if mouse is over checkmark button
+            is_checkmark_hot := ui_point_in_rect(ctx.mouse_x, ctx.mouse_y, checkmark_x, checkmark_y, checkmark_size, checkmark_size)
+
+            // Checkmark button background
+            checkmark_bg_color := is_checkmark_hot ? [4]u8{0, 150, 0, 255} : [4]u8{0, 100, 0, 255}  // Green
+            ui_render_rect(ctx, checkmark_x, checkmark_y, checkmark_size, checkmark_size, checkmark_bg_color)
+
+            // Checkmark border
+            border_width_check: f32 = 1.0
+            ui_render_rect(ctx, checkmark_x, checkmark_y, checkmark_size, border_width_check, {0, 255, 0, 255})
+            ui_render_rect(ctx, checkmark_x, checkmark_y + checkmark_size - border_width_check, checkmark_size, border_width_check, {0, 255, 0, 255})
+            ui_render_rect(ctx, checkmark_x, checkmark_y, border_width_check, checkmark_size, {0, 255, 0, 255})
+            ui_render_rect(ctx, checkmark_x + checkmark_size - border_width_check, checkmark_y, border_width_check, checkmark_size, {0, 255, 0, 255})
+
+            // Checkmark text "✓"
+            checkmark_text := "OK"  // Using "OK" since "✓" might not render well
+            check_text_width, check_text_height := ui_measure_text(ctx, checkmark_text, ctx.style.font_size_small)
+            check_text_x := checkmark_x + (checkmark_size - check_text_width) * 0.5
+            check_text_y := checkmark_y + (checkmark_size - check_text_height) * 0.5
+            ui_render_text(ctx, checkmark_text, check_text_x, check_text_y, ctx.style.font_size_small, {255, 255, 255, 255})
+
+            // Detect click on checkmark button
+            if is_checkmark_hot {
+                ctx.mouse_over_ui = true
+                if !ctx.mouse_down_prev && ctx.mouse_down {
+                    // Trigger finish edit action
+                    interaction.double_clicked = true  // Reuse this flag to signal "finish editing"
+                    interaction.clicked_feature_id = feature.id
+                }
+            }
+        }
 
         // Visibility toggle (small indicator)
         if feature.visible {
@@ -507,7 +710,8 @@ ui_feature_tree_panel :: proc(
         current_y += item_height + 4
     }
 
-    return current_y - y  // Return total height used
+    height = current_y - y  // Return total height used
+    return
 }
 
 // =============================================================================
@@ -579,10 +783,11 @@ ui_mode_indicator_banner :: proc(
 // Status Bar - Bottom info bar
 // =============================================================================
 
-ui_status_bar :: proc(
+ui_cad_status_bar :: proc(
     ctx: ^UIContext,
     is_sketch_mode: bool,
     sk: ^sketch.Sketch2D,
+    editing_constraint_id: int,  // NEW: Pass editing state
     screen_width: u32,
     screen_height: u32,
 ) {
@@ -622,7 +827,7 @@ ui_status_bar :: proc(
         case .Dimension: tool_name = "Dimension"
         }
 
-        status_text = fmt.tprintf("Tool: %s  |  Entities: %d  |  Constraints: %d  |  [L] Line [C] Circle [H] Horizontal [V] Vertical",
+        status_text = fmt.tprintf("Tool: %s  |  Entities: %d  |  Constraints: %d  |  [L] Line [C] Circle [D] Smart Dimension (distance/angular/Ø)",
             tool_name, len(sk.entities), len(sk.constraints))
     } else {
         // Solid Mode: Gray badge
@@ -655,6 +860,12 @@ ui_status_bar :: proc(
     // Draw status text after separator
     status_x := separator_x + 12
     status_y := bar_y + (bar_height - ctx.style.font_size_small) * 0.5
+
+    // If editing constraint, show instructions instead of normal status
+    if editing_constraint_id >= 0 {
+        status_text = "[ENTER] Confirm    [ESC] Cancel editing"
+    }
+
     ui_render_text(ctx, status_text, status_x, status_y, ctx.style.font_size_small, ctx.style.text_secondary)
 }
 
@@ -669,6 +880,9 @@ ui_cad_layout :: proc(
     sk: ^sketch.Sketch2D,
     feature_tree: ^ftree.FeatureTree,
     extrude_feature_id: int,
+    editing_constraint_id: int,  // NEW: Pass editing state
+    editing_feature_id: int,     // NEW: ID of feature being edited (-1 if none)
+    document_settings: ^doc.DocumentSettings,  // NEW: Pass document settings
     screen_width: u32,
     screen_height: u32,
 ) -> bool {
@@ -697,6 +911,7 @@ ui_cad_layout :: proc(
         sk,
         feature_tree,
         extrude_feature_id,
+        document_settings,  // NEW: Pass document settings
         panel_x, properties_y,
         cad_state.properties_width,
     )
@@ -705,18 +920,26 @@ ui_cad_layout :: proc(
         needs_update = true
     }
 
-    // Draw feature tree below properties
+    // Draw feature tree below properties - NOW returns interaction info
     feature_tree_y := properties_y + properties_height + 20
-    _ = ui_feature_tree_panel(
+    feature_tree_height, tree_interaction := ui_feature_tree_panel(
         ctx,
         cad_state,
         feature_tree,
         panel_x, feature_tree_y,
         cad_state.feature_tree_width,
+        editing_feature_id,  // NEW: Pass actual editing_feature_id from app state
     )
 
+    // Store feature tree interaction for main app to handle
+    // (caller will check ctx.feature_tree_click_id after this function returns)
+    ctx.feature_tree_click_id = tree_interaction.clicked_feature_id
+
+    // Store checkmark button click state (reuses double_clicked flag from UI)
+    ctx.checkmark_clicked = tree_interaction.double_clicked
+
     // Draw status bar at bottom
-    ui_status_bar(ctx, is_sketch_mode, sk, screen_width, screen_height)
+    ui_cad_status_bar(ctx, is_sketch_mode, sk, editing_constraint_id, screen_width, screen_height)
 
     return needs_update
 }

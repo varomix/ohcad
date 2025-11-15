@@ -58,10 +58,8 @@ DeleteEntityCommand :: struct {
 // AddPointCommand Operations
 // =============================================================================
 
-add_point_command_execute :: proc(cmd: AddPointCommand) -> bool {
-    // Modify the command to store the created point ID
-    cmd_mut := cmd
-    cmd_mut.point_id = sketch.sketch_add_point(cmd.sketch_ref, cmd.x, cmd.y, cmd.fixed)
+add_point_command_execute :: proc(cmd: ^AddPointCommand) -> bool {
+    cmd.point_id = sketch.sketch_add_point(cmd.sketch_ref, cmd.x, cmd.y, cmd.fixed)
     return true
 }
 
@@ -103,10 +101,9 @@ add_point_command_destroy :: proc(cmd: AddPointCommand) {
 // AddLineCommand Operations
 // =============================================================================
 
-add_line_command_execute :: proc(cmd: AddLineCommand) -> bool {
-    cmd_mut := cmd
-    cmd_mut.line_id = sketch.sketch_add_line(cmd.sketch_ref, cmd.start_id, cmd.end_id)
-    cmd_mut.entity_index = len(cmd.sketch_ref.entities) - 1
+add_line_command_execute :: proc(cmd: ^AddLineCommand) -> bool {
+    cmd.line_id = sketch.sketch_add_line(cmd.sketch_ref, cmd.start_id, cmd.end_id)
+    cmd.entity_index = len(cmd.sketch_ref.entities) - 1
     return true
 }
 
@@ -159,10 +156,9 @@ add_line_command_destroy :: proc(cmd: AddLineCommand) {
 // AddCircleCommand Operations
 // =============================================================================
 
-add_circle_command_execute :: proc(cmd: AddCircleCommand) -> bool {
-    cmd_mut := cmd
-    cmd_mut.circle_id = sketch.sketch_add_circle(cmd.sketch_ref, cmd.center_id, cmd.radius)
-    cmd_mut.entity_index = len(cmd.sketch_ref.entities) - 1
+add_circle_command_execute :: proc(cmd: ^AddCircleCommand) -> bool {
+    cmd.circle_id = sketch.sketch_add_circle(cmd.sketch_ref, cmd.center_id, cmd.radius)
+    cmd.entity_index = len(cmd.sketch_ref.entities) - 1
     return true
 }
 
@@ -215,10 +211,9 @@ add_circle_command_destroy :: proc(cmd: AddCircleCommand) {
 // AddArcCommand Operations
 // =============================================================================
 
-add_arc_command_execute :: proc(cmd: AddArcCommand) -> bool {
-    cmd_mut := cmd
-    cmd_mut.arc_id = sketch.sketch_add_arc(cmd.sketch_ref, cmd.center_id, cmd.start_id, cmd.end_id, cmd.radius)
-    cmd_mut.entity_index = len(cmd.sketch_ref.entities) - 1
+add_arc_command_execute :: proc(cmd: ^AddArcCommand) -> bool {
+    cmd.arc_id = sketch.sketch_add_arc(cmd.sketch_ref, cmd.center_id, cmd.start_id, cmd.end_id, cmd.radius)
+    cmd.entity_index = len(cmd.sketch_ref.entities) - 1
     return true
 }
 
@@ -273,11 +268,10 @@ add_arc_command_destroy :: proc(cmd: AddArcCommand) {
 // DeleteEntityCommand Operations
 // =============================================================================
 
-delete_entity_command_execute :: proc(cmd: DeleteEntityCommand) -> bool {
+delete_entity_command_execute :: proc(cmd: ^DeleteEntityCommand) -> bool {
     // Store the entity before deleting
     if cmd.entity_index >= 0 && cmd.entity_index < len(cmd.sketch_ref.entities) {
-        cmd_mut := cmd
-        cmd_mut.deleted_entity = cmd.sketch_ref.entities[cmd.entity_index]
+        cmd.deleted_entity = cmd.sketch_ref.entities[cmd.entity_index]
 
         // Delete the entity
         ordered_remove(&cmd.sketch_ref.entities, cmd.entity_index)

@@ -67,7 +67,7 @@ SketchTool :: enum {
     Line,
     Circle,
     Arc,
-    Dimension,  // Distance dimension tool
+    Dimension,  // Smart dimension tool (distance, angular, diameter)
 }
 
 // 2D Sketch data structure
@@ -88,7 +88,8 @@ Sketch2D :: struct {
     next_constraint_id: int,
 
     // Selection state
-    selected_entity: int,  // -1 if nothing selected
+    selected_entity: int,      // -1 if nothing selected
+    selected_constraint_id: int,  // -1 if no constraint selected
 
     // Tool state
     current_tool: SketchTool,
@@ -97,6 +98,16 @@ Sketch2D :: struct {
     first_point_id: int,         // First point in tool operations (-1 if none)
     second_point_id: int,        // Second point for dimension tool (-1 if none)
     chain_start_point_id: int,   // Original start point of line chain (for auto-close detection)
+
+    // Angular dimension tool state
+    first_line_id: int,          // First line for angular dimension (-1 if none)
+    second_line_id: int,         // Second line for angular dimension (-1 if none)
+    angular_offset: m.Vec2,      // Arc position for angular dimension
+
+    // Dimension dragging state
+    dragging_constraint_id: int, // ID of constraint being dragged (-1 if none)
+    drag_start_pos: m.Vec2,      // Starting position of drag (in sketch coordinates)
+    drag_offset_start: m.Vec2,   // Original offset of constraint before drag started
 }
 
 // =============================================================================
@@ -182,10 +193,19 @@ sketch_init :: proc(name: string, plane: SketchPlane) -> Sketch2D {
         next_entity_id = 0,
         next_constraint_id = 0,
         selected_entity = -1,
+        selected_constraint_id = -1,  // No constraint selected initially
         current_tool = .Select,
         temp_point = m.Vec2{0, 0},
         temp_point_valid = false,
         first_point_id = -1,
+        second_point_id = -1,         // No second point initially (for dimension tool)
+        chain_start_point_id = -1,    // No chain start initially (for line tool auto-close)
+        first_line_id = -1,           // No first line initially (for angular dimension tool)
+        second_line_id = -1,          // No second line initially (for angular dimension tool)
+        angular_offset = m.Vec2{0, 0}, // No angular offset initially
+        dragging_constraint_id = -1,  // Not dragging any constraint
+        drag_start_pos = m.Vec2{0, 0},
+        drag_offset_start = m.Vec2{0, 0},
     }
 }
 

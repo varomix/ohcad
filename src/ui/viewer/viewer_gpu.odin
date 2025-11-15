@@ -7,6 +7,7 @@ import "core:math"
 import "core:os"
 import "core:strings"
 import "core:image/png"
+import doc "../../core/document"
 import m "../../core/math"
 import t "../../core/topology"
 import sketch "../../features/sketch"
@@ -14,6 +15,15 @@ import extrude "../../features/extrude"
 import sdl "vendor:sdl3"
 import glsl "core:math/linalg/glsl"
 import fs "vendor:fontstash"
+
+// =============================================================================
+// Pre-allocated GPU resources for inline rendering (reusable buffers)
+// =============================================================================
+
+InlineRenderResources :: struct {
+    rect_vertex_buffer: ^sdl.GPUBuffer,     // 6 vertices for a quad (2 triangles)
+    rect_transfer_buffer: ^sdl.GPUTransferBuffer,
+}
 
 // =============================================================================
 // Viewer Configuration
@@ -1212,6 +1222,35 @@ viewer_gpu_render_single_point :: proc(
 }
 
 // =============================================================================
+// Geometric Helper Functions
+// =============================================================================
+
+// Calculate intersection point of two lines in 2D
+// Returns the intersection point, or midpoint if lines are parallel
+calculate_line_intersection_2d :: proc(p1: m.Vec2, p2: m.Vec2, p3: m.Vec2, p4: m.Vec2) -> m.Vec2 {
+    // Line 1: p1 + t * (p2 - p1)
+    // Line 2: p3 + u * (p4 - p3)
+
+    d1 := p2 - p1
+    d2 := p4 - p3
+
+    // Calculate denominator (cross product)
+    denom := d1.x * d2.y - d1.y * d2.x
+
+    // If lines are parallel (denominator ~ 0), return midpoint
+    if glsl.abs(denom) < 1e-10 {
+        return (p1 + p2) * 0.5
+    }
+
+    // Calculate t parameter for line 1
+    diff := p3 - p1
+    t := (diff.x * d2.y - diff.y * d2.x) / denom
+
+    // Calculate intersection point
+    return p1 + d1 * t
+}
+
+// =============================================================================
 // Preview Geometry Rendering
 // =============================================================================
 
@@ -1236,7 +1275,7 @@ viewer_gpu_render_sketch_preview :: proc(
             {f32(cursor_3d.x + size), f32(cursor_3d.y), f32(cursor_3d.z)},
         },
     }
-    viewer_gpu_render_thick_lines(viewer, cmd, pass, h_line, {0, 1, 1, 1}, mvp, 2.0)
+    viewer_gpu_render_thick_lines(viewer, cmd, pass, h_line, {0, 1, 1, 1}, mvp, 1.2)
 
     // Vertical line
     v_line := [][2][3]f32{
@@ -1245,7 +1284,7 @@ viewer_gpu_render_sketch_preview :: proc(
             {f32(cursor_3d.x), f32(cursor_3d.y + size), f32(cursor_3d.z)},
         },
     }
-    viewer_gpu_render_thick_lines(viewer, cmd, pass, v_line, {0, 1, 1, 1}, mvp, 2.0)
+    viewer_gpu_render_thick_lines(viewer, cmd, pass, v_line, {0, 1, 1, 1}, mvp, 1.2)
 
     // If line tool has first point, draw preview line
     if sk.current_tool == .Line && sk.first_point_id != -1 {
@@ -1260,7 +1299,7 @@ viewer_gpu_render_sketch_preview :: proc(
                     {f32(cursor_3d.x), f32(cursor_3d.y), f32(cursor_3d.z)},
                 },
             }
-            viewer_gpu_render_thick_lines(viewer, cmd, pass, preview_line, {0, 1, 1, 0.7}, mvp, 2.0)
+            viewer_gpu_render_thick_lines(viewer, cmd, pass, preview_line, {0, 1, 1, 0.7}, mvp, 1.2)
 
             // Visual feedback for auto-close: Highlight chain start point in yellow if cursor is near it
             AUTO_CLOSE_THRESHOLD :: 0.15
@@ -1275,6 +1314,385 @@ viewer_gpu_render_sketch_preview :: proc(
                         // Render larger yellow point to indicate auto-close is available
                         viewer_gpu_render_single_point(viewer, cmd, pass, sk, chain_start_pt, mvp, {1.0, 1.0, 0.0, 1.0}, 8.0)
                     }
+                }
+            }
+        }
+    }
+
+    // If dimension tool has both points selected, draw preview dimension
+    if sk.current_tool == .Dimension && sk.first_point_id != -1 && sk.second_point_id != -1 {
+        // Get the two points
+        pt1 := sketch.sketch_get_point(sk, sk.first_point_id)
+        pt2 := sketch.sketch_get_point(sk, sk.second_point_id)
+
+        if pt1 != nil && pt2 != nil {
+            p1_2d := m.Vec2{pt1.x, pt1.y}
+            p2_2d := m.Vec2{pt2.x, pt2.y}
+
+            edge_vec := p2_2d - p1_2d
+            edge_midpoint := (p1_2d + p2_2d) * 0.5
+            cursor_vec := sk.temp_point - edge_midpoint
+
+            // Determine dimension type based on cursor position (matching tool logic)
+            dimension_type: sketch.ConstraintType
+            is_edge_dimension := sk.first_line_id >= 0
+
+            if is_edge_dimension {
+                // Edge dimension - always parallel to edge
+                dimension_type = .Distance
+            } else {
+                // Point-to-point - smart H/V detection
+                abs_cursor_x := glsl.abs(cursor_vec.x)
+                abs_cursor_y := glsl.abs(cursor_vec.y)
+                HORIZONTAL_THRESHOLD :: 0.3
+                VERTICAL_THRESHOLD :: 0.3
+
+                if abs_cursor_y > abs_cursor_x * (1.0 + HORIZONTAL_THRESHOLD) {
+                    dimension_type = .DistanceX  // Horizontal
+                } else if abs_cursor_x > abs_cursor_y * (1.0 + VERTICAL_THRESHOLD) {
+                    dimension_type = .DistanceY  // Vertical
+                } else {
+                    dimension_type = .Distance   // Diagonal
+                }
+            }
+
+            preview_lines := make([dynamic][2][3]f32, context.temp_allocator)
+
+            // Render based on dimension type
+            #partial switch dimension_type {
+            case .DistanceX:
+                // Horizontal dimension preview
+                dim_y := sk.temp_point.y
+                dim1_2d := m.Vec2{p1_2d.x, dim_y}
+                dim2_2d := m.Vec2{p2_2d.x, dim_y}
+
+                // Extension lines
+                p1_3d := sketch.sketch_to_world(&sk.plane, p1_2d)
+                dim1_3d := sketch.sketch_to_world(&sk.plane, dim1_2d)
+                append(&preview_lines, [2][3]f32{
+                    {f32(p1_3d.x), f32(p1_3d.y), f32(p1_3d.z)},
+                    {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
+                })
+
+                p2_3d := sketch.sketch_to_world(&sk.plane, p2_2d)
+                dim2_3d := sketch.sketch_to_world(&sk.plane, dim2_2d)
+                append(&preview_lines, [2][3]f32{
+                    {f32(p2_3d.x), f32(p2_3d.y), f32(p2_3d.z)},
+                    {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+                })
+
+                // Dimension line
+                append(&preview_lines, [2][3]f32{
+                    {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
+                    {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+                })
+
+                // Arrows
+                dim_vec := dim2_2d - dim1_2d
+                dim_len := glsl.length(dim_vec)
+                dim_dir := m.Vec2{1.0, 0.0}
+                if dim_len > 0.001 {
+                    dim_dir = dim_vec / dim_len
+                }
+                arrow_lines := render_dimension_arrow_heads(sk, dim1_2d, dim2_2d, dim_dir, 0.15, 30.0)
+                for arrow_line in arrow_lines {
+                    append(&preview_lines, arrow_line)
+                }
+
+            case .DistanceY:
+                // Vertical dimension preview
+                dim_x := sk.temp_point.x
+                dim1_2d := m.Vec2{dim_x, p1_2d.y}
+                dim2_2d := m.Vec2{dim_x, p2_2d.y}
+
+                // Extension lines
+                p1_3d := sketch.sketch_to_world(&sk.plane, p1_2d)
+                dim1_3d := sketch.sketch_to_world(&sk.plane, dim1_2d)
+                append(&preview_lines, [2][3]f32{
+                    {f32(p1_3d.x), f32(p1_3d.y), f32(p1_3d.z)},
+                    {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
+                })
+
+                p2_3d := sketch.sketch_to_world(&sk.plane, p2_2d)
+                dim2_3d := sketch.sketch_to_world(&sk.plane, dim2_2d)
+                append(&preview_lines, [2][3]f32{
+                    {f32(p2_3d.x), f32(p2_3d.y), f32(p2_3d.z)},
+                    {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+                })
+
+                // Dimension line
+                append(&preview_lines, [2][3]f32{
+                    {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
+                    {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+                })
+
+                // Arrows
+                dim_vec := dim2_2d - dim1_2d
+                dim_len := glsl.length(dim_vec)
+                dim_dir := m.Vec2{0.0, 1.0}
+                if dim_len > 0.001 {
+                    dim_dir = dim_vec / dim_len
+                }
+                arrow_lines := render_dimension_arrow_heads(sk, dim1_2d, dim2_2d, dim_dir, 0.15, 30.0)
+                for arrow_line in arrow_lines {
+                    append(&preview_lines, arrow_line)
+                }
+
+            case .Distance:
+                // Diagonal dimension preview (perpendicular offset)
+                edge_len := glsl.length(edge_vec)
+                if edge_len > 1e-10 {
+                    edge_dir := edge_vec / edge_len
+                    perp_dir := m.Vec2{-edge_dir.y, edge_dir.x}
+
+                    to_offset := sk.temp_point - edge_midpoint
+                    offset_distance := glsl.dot(to_offset, perp_dir)
+
+                    MIN_OFFSET :: 0.3
+                    if glsl.abs(offset_distance) < MIN_OFFSET {
+                        offset_distance = MIN_OFFSET * glsl.sign(offset_distance)
+                        if offset_distance == 0 {
+                            offset_distance = MIN_OFFSET
+                        }
+                    }
+
+                    dim1_2d := p1_2d + perp_dir * offset_distance
+                    dim2_2d := p2_2d + perp_dir * offset_distance
+
+                    dim1_3d := sketch.sketch_to_world(&sk.plane, dim1_2d)
+                    dim2_3d := sketch.sketch_to_world(&sk.plane, dim2_2d)
+
+                    // Extension lines
+                    p1_3d := sketch.sketch_to_world(&sk.plane, p1_2d)
+                    append(&preview_lines, [2][3]f32{
+                        {f32(p1_3d.x), f32(p1_3d.y), f32(p1_3d.z)},
+                        {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
+                    })
+
+                    p2_3d := sketch.sketch_to_world(&sk.plane, p2_2d)
+                    append(&preview_lines, [2][3]f32{
+                        {f32(p2_3d.x), f32(p2_3d.y), f32(p2_3d.z)},
+                        {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+                    })
+
+                    // Dimension line
+                    append(&preview_lines, [2][3]f32{
+                        {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
+                        {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+                    })
+
+                    // Arrows
+                    dim_vec := dim2_2d - dim1_2d
+                    dim_dir := dim_vec / glsl.length(dim_vec)
+                    arrow_lines := render_dimension_arrow_heads(sk, dim1_2d, dim2_2d, dim_dir, 0.15, 30.0)
+                    for arrow_line in arrow_lines {
+                        append(&preview_lines, arrow_line)
+                    }
+                }
+            }
+
+            // Draw preview dimension in bright cyan (semi-transparent)
+            viewer_gpu_render_thick_lines(viewer, cmd, pass, preview_lines[:], {0, 1, 1, 0.7}, mvp, 1.2)
+        }
+    }
+
+    // ANGULAR DIMENSION PREVIEW: If dimension tool has both lines selected, draw preview arc
+    if sk.current_tool == .Dimension && sk.first_line_id >= 0 && sk.second_line_id >= 0 {
+        // Get both line entities
+        line1, ok1 := sk.entities[sk.first_line_id].(sketch.SketchLine)
+        line2, ok2 := sk.entities[sk.second_line_id].(sketch.SketchLine)
+
+        if ok1 && ok2 {
+            // Get line endpoints
+            p1_start := sketch.sketch_get_point(sk, line1.start_id)
+            p1_end := sketch.sketch_get_point(sk, line1.end_id)
+            p2_start := sketch.sketch_get_point(sk, line2.start_id)
+            p2_end := sketch.sketch_get_point(sk, line2.end_id)
+
+            if p1_start != nil && p1_end != nil && p2_start != nil && p2_end != nil {
+                // Calculate line direction vectors
+                v1 := m.Vec2{p1_end.x - p1_start.x, p1_end.y - p1_start.y}
+                v2 := m.Vec2{p2_end.x - p2_start.x, p2_end.y - p2_start.y}
+
+                len1 := glsl.length(v1)
+                len2 := glsl.length(v2)
+
+                if len1 > 1e-10 && len2 > 1e-10 {
+                    v1 = v1 / len1
+                    v2 = v2 / len2
+
+                    // Calculate angle using atan2
+                    dot := v1.x * v2.x + v1.y * v2.y
+                    cross := v1.x * v2.y - v1.y * v2.x
+                    angle_rad := math.atan2(cross, dot)
+                    angle_deg := angle_rad * 180.0 / math.PI
+                    if angle_deg < 0 do angle_deg += 360.0
+                    if angle_deg > 180.0 do angle_deg = 360.0 - angle_deg
+
+                    // Find arc center: Use shared vertex if lines share one, otherwise use intersection
+                    center_2d: m.Vec2
+
+                    // Check if lines share a common vertex (adjacent edges)
+                    p1_start_2d := m.Vec2{p1_start.x, p1_start.y}
+                    p1_end_2d := m.Vec2{p1_end.x, p1_end.y}
+                    p2_start_2d := m.Vec2{p2_start.x, p2_start.y}
+                    p2_end_2d := m.Vec2{p2_end.x, p2_end.y}
+
+                    VERTEX_TOLERANCE :: 0.001
+
+                    if glsl.length(p1_start_2d - p2_start_2d) < VERTEX_TOLERANCE {
+                        center_2d = p1_start_2d  // Shared start-start vertex
+                    } else if glsl.length(p1_start_2d - p2_end_2d) < VERTEX_TOLERANCE {
+                        center_2d = p1_start_2d  // Shared start-end vertex
+                    } else if glsl.length(p1_end_2d - p2_start_2d) < VERTEX_TOLERANCE {
+                        center_2d = p1_end_2d    // Shared end-start vertex
+                    } else if glsl.length(p1_end_2d - p2_end_2d) < VERTEX_TOLERANCE {
+                        center_2d = p1_end_2d    // Shared end-end vertex
+                    } else {
+                        // No shared vertex - calculate intersection point
+                        center_2d = calculate_line_intersection_2d(p1_start_2d, p1_end_2d, p2_start_2d, p2_end_2d)
+                    }
+
+                    // Arc radius: distance from center to cursor
+                    radius := glsl.length(sk.temp_point - center_2d)
+
+                    // Clamp radius to reasonable range
+                    MIN_RADIUS :: 0.3
+                    MAX_RADIUS :: 3.0
+                    radius = glsl.clamp(radius, MIN_RADIUS, MAX_RADIUS)
+
+                    // QUADRANT-BASED ARC SELECTION (OnShape-style)
+                    // Based on cursor position, select which pair of directions to use for the arc
+                    // The 4 quadrants use different combinations of edge directions and extensions
+
+                    // Determine which direction each line points FROM the shared vertex
+                    v1_from_corner := v1
+                    v2_from_corner := v2
+
+                    // Check which endpoint of line1 is the shared corner
+                    dist_to_p1_start := glsl.length(center_2d - p1_start_2d)
+                    dist_to_p1_end := glsl.length(center_2d - p1_end_2d)
+
+                    if dist_to_p1_start < 0.001 {
+                        // START is corner → v1 points away (start to end)
+                        v1_from_corner = v1
+                    } else if dist_to_p1_end < 0.001 {
+                        // END is corner → reverse v1 to point away (end to start)
+                        v1_from_corner = -v1
+                    }
+
+                    // Check which endpoint of line2 is the shared corner
+                    dist_to_p2_start := glsl.length(center_2d - p2_start_2d)
+                    dist_to_p2_end := glsl.length(center_2d - p2_end_2d)
+
+                    if dist_to_p2_start < 0.001 {
+                        // START is corner → v2 points away (start to end)
+                        v2_from_corner = v2
+                    } else if dist_to_p2_end < 0.001 {
+                        // END is corner → reverse v2 to point away (end to start)
+                        v2_from_corner = -v2
+                    }
+
+                    // Calculate cursor direction from corner
+                    to_cursor := sk.temp_point - center_2d
+                    cursor_len := glsl.length(to_cursor)
+                    if cursor_len < 1e-10 do return  // Cursor too close to corner
+
+                    // CRITICAL INSIGHT: We need to test which of 4 arcs contains the cursor.
+                    // Each arc is defined by two directions (which can be edge or -edge).
+                    // The arc that contains the cursor is the one we draw.
+
+                    // Calculate angles for the edge directions
+                    a1 := math.atan2(f64(v1_from_corner.y), f64(v1_from_corner.x))
+                    a2 := math.atan2(f64(v2_from_corner.y), f64(v2_from_corner.x))
+                    a1_neg := a1 + math.PI  // Opposite of v1
+                    a2_neg := a2 + math.PI  // Opposite of v2
+                    a_cursor := math.atan2(f64(to_cursor.y), f64(to_cursor.x))
+
+                    // Normalize all angles to [0, 2π]
+                    normalize_angle :: proc(a: f64) -> f64 {
+                        result := a
+                        for result < 0 do result += 2.0 * math.PI
+                        for result >= 2.0 * math.PI do result -= 2.0 * math.PI
+                        return result
+                    }
+
+                    a1 = normalize_angle(a1)
+                    a2 = normalize_angle(a2)
+                    a1_neg = normalize_angle(a1_neg)
+                    a2_neg = normalize_angle(a2_neg)
+                    a_cursor = normalize_angle(a_cursor)
+
+                    // Determine which pair of vectors to use for the arc
+                    arc_start, arc_end: f64
+
+                    // Test all 4 possible arcs in sequence - test if cursor is in CCW arc from start to end
+                    // Arc 1: v1 → v2 (ORANGE - inside angle)
+                    {
+                        sweep := a2 - a1
+                        if sweep < 0 do sweep += 2.0 * math.PI
+                        offset := a_cursor - a1
+                        if offset < 0 do offset += 2.0 * math.PI
+                        if offset <= sweep {
+                            arc_start = a1
+                            arc_end = a2
+                        } else {
+                            // Arc 2: v2 → -v1 (PURPLE - one extension)
+                            sweep2 := a1_neg - a2
+                            if sweep2 < 0 do sweep2 += 2.0 * math.PI
+                            offset2 := a_cursor - a2
+                            if offset2 < 0 do offset2 += 2.0 * math.PI
+                            if offset2 <= sweep2 {
+                                arc_start = a2
+                                arc_end = a1_neg
+                            } else {
+                                // Arc 3: -v1 → -v2 (BLUE - outside angle)
+                                sweep3 := a2_neg - a1_neg
+                                if sweep3 < 0 do sweep3 += 2.0 * math.PI
+                                offset3 := a_cursor - a1_neg
+                                if offset3 < 0 do offset3 += 2.0 * math.PI
+                                if offset3 <= sweep3 {
+                                    arc_start = a1_neg
+                                    arc_end = a2_neg
+                                } else {
+                                    // Arc 4: -v2 → v1 (GREEN - other extension)
+                                    arc_start = a2_neg
+                                    arc_end = a1
+                                }
+                            }
+                        }
+                    }
+
+                    // Calculate CCW sweep angle
+                    start_angle := arc_start
+                    sweep_angle := arc_end - arc_start
+                    if sweep_angle < 0 do sweep_angle += 2.0 * math.PI
+
+                    // Tessellate arc into line segments (24 segments for smooth preview)
+                    segments := 24
+                    arc_lines := make([dynamic][2][3]f32, context.temp_allocator)
+
+                    for i in 0..<segments {
+                        t0 := f64(i) / f64(segments)
+                        t1 := f64(i + 1) / f64(segments)
+
+                        angle0 := start_angle + sweep_angle * t0
+                        angle1_seg := start_angle + sweep_angle * t1
+
+                        p0_2d := center_2d + m.Vec2{radius * math.cos(angle0), radius * math.sin(angle0)}
+                        p1_2d := center_2d + m.Vec2{radius * math.cos(angle1_seg), radius * math.sin(angle1_seg)}
+
+                        p0_3d := sketch.sketch_to_world(&sk.plane, p0_2d)
+                        p1_3d := sketch.sketch_to_world(&sk.plane, p1_2d)
+
+                        append(&arc_lines, [2][3]f32{
+                            {f32(p0_3d.x), f32(p0_3d.y), f32(p0_3d.z)},
+                            {f32(p1_3d.x), f32(p1_3d.y), f32(p1_3d.z)},
+                        })
+                    }
+
+                    // Draw preview arc in bright yellow (semi-transparent)
+                    viewer_gpu_render_thick_lines(viewer, cmd, pass, arc_lines[:], {1.0, 1.0, 0.0, 0.7}, mvp, 1.5)
                 }
             }
         }
@@ -1316,7 +1734,7 @@ viewer_gpu_render_sketch_preview :: proc(
             }
 
             // Draw preview circle in bright cyan
-            viewer_gpu_render_thick_lines(viewer, cmd, pass, circle_lines[:], {0, 1, 1, 0.7}, mvp, 2.0)
+            viewer_gpu_render_thick_lines(viewer, cmd, pass, circle_lines[:], {0, 1, 1, 0.7}, mvp, 1.2)
 
             // Draw radius line from center to cursor
             center_3d := sketch.sketch_to_world(&sk.plane, center_2d)
@@ -1345,6 +1763,7 @@ viewer_gpu_render_sketch_constraints :: proc(
     mvp: matrix[4,4]f32,
     view: matrix[4,4]f32,
     proj: matrix[4,4]f32,
+    document_settings: ^doc.DocumentSettings = nil,  // NEW: For unit formatting
 ) {
     if sk == nil do return
     if sk.constraints == nil do return
@@ -1353,22 +1772,33 @@ viewer_gpu_render_sketch_constraints :: proc(
     for constraint in sk.constraints {
         if !constraint.enabled do continue
 
+        // Check if this constraint is selected
+        is_selected := (constraint.id == sk.selected_constraint_id)
+
         switch data in constraint.data {
         case sketch.DistanceData:
-            render_distance_dimension_gpu(viewer, cmd, pass, text_renderer, sk, data, mvp, view, proj)
+            render_distance_dimension_gpu(viewer, cmd, pass, text_renderer, sk, data, mvp, view, proj, is_selected, document_settings)
 
         case sketch.HorizontalData:
-            render_horizontal_icon_gpu(viewer, cmd, pass, sk, data, mvp)
+            render_horizontal_icon_gpu(viewer, cmd, pass, sk, data, mvp, is_selected)
 
         case sketch.VerticalData:
-            render_vertical_icon_gpu(viewer, cmd, pass, sk, data, mvp)
+            render_vertical_icon_gpu(viewer, cmd, pass, sk, data, mvp, is_selected)
+
+        case sketch.AngleData:
+            render_angular_dimension_gpu(viewer, cmd, pass, text_renderer, sk, data, mvp, view, proj, is_selected)
+
+        case sketch.DistanceXData:
+            render_distance_x_dimension_gpu(viewer, cmd, pass, text_renderer, sk, data, mvp, view, proj, is_selected, document_settings)
+
+        case sketch.DistanceYData:
+            render_distance_y_dimension_gpu(viewer, cmd, pass, text_renderer, sk, data, mvp, view, proj, is_selected, document_settings)
 
         case sketch.PerpendicularData, sketch.ParallelData, sketch.CoincidentData, sketch.EqualData:
             // These constraint types can be added later if needed
             // For now, focusing on the most important: Distance dimensions
 
-        case sketch.DistanceXData, sketch.DistanceYData, sketch.AngleData, sketch.TangentData,
-             sketch.PointOnLineData, sketch.PointOnCircleData, sketch.FixedPointData:
+        case sketch.TangentData, sketch.PointOnLineData, sketch.PointOnCircleData, sketch.FixedPointData:
             // Additional constraint types - can be added incrementally
         }
     }
@@ -1385,6 +1815,8 @@ render_distance_dimension_gpu :: proc(
     mvp: matrix[4,4]f32,
     view: matrix[4,4]f32,
     proj: matrix[4,4]f32,
+    is_selected: bool,  // NEW: Highlight if selected
+    document_settings: ^doc.DocumentSettings = nil,  // NEW: For unit formatting
 ) {
     if data.point1_id < 0 || data.point1_id >= len(sk.points) do return
     if data.point2_id < 0 || data.point2_id >= len(sk.points) do return
@@ -1444,14 +1876,81 @@ render_distance_dimension_gpu :: proc(
         {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
     })
 
-    // Dimension line itself
-    append(&dim_lines, [2][3]f32{
-        {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
-        {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
-    })
+    // Calculate dimension line direction in 2D
+    dim_vec := dim2_2d - dim1_2d
+    dim_dir := dim_vec / glsl.length(dim_vec)
 
-    // Draw dimension lines in bright yellow
-    viewer_gpu_render_thick_lines(viewer, cmd, pass, dim_lines[:], {1.0, 1.0, 0.0, 1.0}, mvp, 2.5)
+    // Calculate text width to create gap
+    text_size: f32 = 20  // Larger, more readable text size
+    text_width_world: f64 = 0.5  // Default gap width in world units
+    text_width_pixels: f32 = 0
+    text_height_pixels: f32 = 0
+
+    if text_renderer != nil {
+        // Format distance value with units if document_settings provided
+        dist_text: string
+        if document_settings != nil {
+            dist_text = doc.document_format_value(document_settings, math.abs(data.distance))
+        } else {
+            dist_text = fmt.tprintf("%.2f", math.abs(data.distance))
+        }
+        text_width_pixels, text_height_pixels = text_measure_gpu(text_renderer, dist_text, text_size)
+
+        // Convert text width from screen pixels to world units
+        viewport_height := f32(viewer.window_height)
+        fov_radians := math.to_radians(viewer.camera.fov)
+        pixel_size_world := f64((2.0 * viewer.camera.distance * math.tan(fov_radians * 0.5)) / viewport_height)
+
+        // Add padding (40% on each side for breathing room)
+        text_width_world = f64(text_width_pixels) * pixel_size_world * 1.8
+    }
+
+    // Calculate gap positions (centered on midpoint)
+    gap_half := text_width_world * 0.5
+    gap_start_2d := mid + perp_dir * offset_distance - dim_dir * gap_half
+    gap_end_2d := mid + perp_dir * offset_distance + dim_dir * gap_half
+
+    // Dimension line with gap (split into two segments)
+    // Left segment: dim1 to gap_start
+    if glsl.length(gap_start_2d - dim1_2d) > 0.01 {
+        gap_start_3d := sketch.sketch_to_world(&sk.plane, gap_start_2d)
+        append(&dim_lines, [2][3]f32{
+            {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
+            {f32(gap_start_3d.x), f32(gap_start_3d.y), f32(gap_start_3d.z)},
+        })
+    }
+
+    // Right segment: gap_end to dim2
+    if glsl.length(dim2_2d - gap_end_2d) > 0.01 {
+        gap_end_3d := sketch.sketch_to_world(&sk.plane, gap_end_2d)
+        append(&dim_lines, [2][3]f32{
+            {f32(gap_end_3d.x), f32(gap_end_3d.y), f32(gap_end_3d.z)},
+            {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+        })
+    }
+
+    // Arrow head size in world units
+    ARROW_SIZE :: 0.15
+    ARROW_ANGLE :: 30.0 // degrees
+
+    // Draw arrow heads at both ends
+    arrow_lines := render_dimension_arrow_heads(
+        sk,
+        dim1_2d,
+        dim2_2d,
+        dim_dir,
+        ARROW_SIZE,
+        ARROW_ANGLE,
+    )
+
+    // Combine dimension lines and arrow lines
+    for arrow_line in arrow_lines {
+        append(&dim_lines, arrow_line)
+    }
+
+    // Draw dimension lines in bright yellow (or white if selected)
+    dim_color := is_selected ? [4]f32{1.0, 1.0, 1.0, 1.0} : [4]f32{1.0, 1.0, 0.0, 1.0}
+    viewer_gpu_render_thick_lines(viewer, cmd, pass, dim_lines[:], dim_color, mvp, 1.5)
 
     // Render dimension text if text renderer available
     if text_renderer != nil {
@@ -1467,13 +1966,113 @@ render_distance_dimension_gpu :: proc(
             screen_x := (ndc.x + 1.0) * 0.5 * f32(viewer.window_width)
             screen_y := (1.0 - ndc.y) * 0.5 * f32(viewer.window_height)
 
-            // Format distance value
-            dist_text := fmt.tprintf("%.2f", data.distance)
+            // Format distance value with units if document_settings provided
+            dist_text: string
+            if document_settings != nil {
+                dist_text = doc.document_format_value(document_settings, math.abs(data.distance))
+            } else {
+                dist_text = fmt.tprintf("%.2f", math.abs(data.distance))
+            }
 
-            // Render text (bright yellow to match dimension line)
-            text_render_2d_gpu(text_renderer, cmd, pass, dist_text, screen_x, screen_y, 16, {255, 255, 0, 255}, viewer.window_width, viewer.window_height)
+            // Center the text by offsetting by half width and half height
+            // Text is rendered with top-left anchor, so we need to shift it
+            text_offset_x := text_width_pixels * 0.5
+            text_offset_y := text_height_pixels * 0.5
+
+            // Render text centered on the midpoint (bright yellow if not selected, white if selected)
+            text_color := is_selected ? [4]u8{255, 255, 255, 255} : [4]u8{255, 255, 0, 255}
+            text_render_2d_gpu(
+                text_renderer,
+                cmd,
+                pass,
+                dist_text,
+                screen_x - text_offset_x,  // Center horizontally
+                screen_y - text_offset_y,  // Center vertically
+                text_size,                 // Use larger text size
+                text_color,
+                viewer.window_width,
+                viewer.window_height,
+            )
         }
     }
+}
+
+// Helper function to create arrow heads for dimension lines
+render_dimension_arrow_heads :: proc(
+    sk: ^sketch.Sketch2D,
+    dim1_2d: m.Vec2,
+    dim2_2d: m.Vec2,
+    dim_dir: m.Vec2,
+    arrow_size: f64,
+    arrow_angle_deg: f64,
+) -> [dynamic][2][3]f32 {
+    arrow_lines := make([dynamic][2][3]f32, context.temp_allocator)
+
+    arrow_angle := math.to_radians(arrow_angle_deg)
+
+    // Left arrow (at dim1, pointing inward)
+    // Rotate dim_dir by +arrow_angle and -arrow_angle
+    cos_a := math.cos(arrow_angle)
+    sin_a := math.sin(arrow_angle)
+
+    // First arrow line (upper)
+    arrow1_dir := m.Vec2{
+        dim_dir.x * cos_a - dim_dir.y * sin_a,
+        dim_dir.x * sin_a + dim_dir.y * cos_a,
+    }
+    arrow1_end_2d := dim1_2d + arrow1_dir * arrow_size
+    arrow1_end_3d := sketch.sketch_to_world(&sk.plane, arrow1_end_2d)
+    dim1_3d := sketch.sketch_to_world(&sk.plane, dim1_2d)
+
+    append(&arrow_lines, [2][3]f32{
+        {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
+        {f32(arrow1_end_3d.x), f32(arrow1_end_3d.y), f32(arrow1_end_3d.z)},
+    })
+
+    // Second arrow line (lower)
+    arrow2_dir := m.Vec2{
+        dim_dir.x * cos_a + dim_dir.y * sin_a,
+        -dim_dir.x * sin_a + dim_dir.y * cos_a,
+    }
+    arrow2_end_2d := dim1_2d + arrow2_dir * arrow_size
+    arrow2_end_3d := sketch.sketch_to_world(&sk.plane, arrow2_end_2d)
+
+    append(&arrow_lines, [2][3]f32{
+        {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
+        {f32(arrow2_end_3d.x), f32(arrow2_end_3d.y), f32(arrow2_end_3d.z)},
+    })
+
+    // Right arrow (at dim2, pointing inward - so use -dim_dir)
+    neg_dir := -dim_dir
+
+    // First arrow line (upper)
+    arrow3_dir := m.Vec2{
+        neg_dir.x * cos_a - neg_dir.y * sin_a,
+        neg_dir.x * sin_a + neg_dir.y * cos_a,
+    }
+    arrow3_end_2d := dim2_2d + arrow3_dir * arrow_size
+    arrow3_end_3d := sketch.sketch_to_world(&sk.plane, arrow3_end_2d)
+    dim2_3d := sketch.sketch_to_world(&sk.plane, dim2_2d)
+
+    append(&arrow_lines, [2][3]f32{
+        {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+        {f32(arrow3_end_3d.x), f32(arrow3_end_3d.y), f32(arrow3_end_3d.z)},
+    })
+
+    // Second arrow line (lower)
+    arrow4_dir := m.Vec2{
+        neg_dir.x * cos_a + neg_dir.y * sin_a,
+        -neg_dir.x * sin_a + neg_dir.y * cos_a,
+    }
+    arrow4_end_2d := dim2_2d + arrow4_dir * arrow_size
+    arrow4_end_3d := sketch.sketch_to_world(&sk.plane, arrow4_end_2d)
+
+    append(&arrow_lines, [2][3]f32{
+        {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+        {f32(arrow4_end_3d.x), f32(arrow4_end_3d.y), f32(arrow4_end_3d.z)},
+    })
+
+    return arrow_lines
 }
 
 // Render horizontal constraint icon (H symbol)
@@ -1484,6 +2083,7 @@ render_horizontal_icon_gpu :: proc(
     sk: ^sketch.Sketch2D,
     data: sketch.HorizontalData,
     mvp: matrix[4,4]f32,
+    is_selected: bool,  // NEW: Highlight if selected
 ) {
     if data.line_id < 0 || data.line_id >= len(sk.entities) do return
 
@@ -1538,10 +2138,10 @@ render_horizontal_icon_gpu :: proc(
     })
 
     // Draw in orange/amber
-    viewer_gpu_render_thick_lines(viewer, cmd, pass, h_lines[:], {1.0, 0.7, 0.0, 1.0}, mvp, 2.0)
+    viewer_gpu_render_thick_lines(viewer, cmd, pass, h_lines[:], {1.0, 0.7, 0.0, 1.0}, mvp, 1.2)
 }
 
-// Render vertical constraint icon (V symbol)
+// Render horizontal constraint icon (V symbol)
 render_vertical_icon_gpu :: proc(
     viewer: ^ViewerGPU,
     cmd: ^sdl.GPUCommandBuffer,
@@ -1549,6 +2149,7 @@ render_vertical_icon_gpu :: proc(
     sk: ^sketch.Sketch2D,
     data: sketch.VerticalData,
     mvp: matrix[4,4]f32,
+    is_selected: bool,  // NEW: Highlight if selected
 ) {
     if data.line_id < 0 || data.line_id >= len(sk.entities) do return
 
@@ -1591,7 +2192,503 @@ render_vertical_icon_gpu :: proc(
     })
 
     // Draw in orange/amber
-    viewer_gpu_render_thick_lines(viewer, cmd, pass, v_lines[:], {1.0, 0.7, 0.0, 1.0}, mvp, 2.0)
+    viewer_gpu_render_thick_lines(viewer, cmd, pass, v_lines[:], {1.0, 0.7, 0.0, 1.0}, mvp, 1.2)
+}
+
+// Render horizontal distance dimension (DistanceX) - measures X-axis distance
+render_distance_x_dimension_gpu :: proc(
+    viewer: ^ViewerGPU,
+    cmd: ^sdl.GPUCommandBuffer,
+    pass: ^sdl.GPURenderPass,
+    text_renderer: ^TextRendererGPU,
+    sk: ^sketch.Sketch2D,
+    data: sketch.DistanceXData,
+    mvp: matrix[4,4]f32,
+    view: matrix[4,4]f32,
+    proj: matrix[4,4]f32,
+    is_selected: bool,
+    document_settings: ^doc.DocumentSettings = nil,  // NEW: For unit formatting
+) {
+    if data.point1_id < 0 || data.point1_id >= len(sk.points) do return
+    if data.point2_id < 0 || data.point2_id >= len(sk.points) do return
+
+    p1 := sketch.sketch_get_point(sk, data.point1_id)
+    p2 := sketch.sketch_get_point(sk, data.point2_id)
+    if p1 == nil || p2 == nil do return
+
+    p1_2d := m.Vec2{p1.x, p1.y}
+    p2_2d := m.Vec2{p2.x, p2.y}
+
+    // Horizontal dimension: measure X distance
+    // Dimension line is horizontal, perpendicular extensions are vertical
+
+    // Get Y position from offset
+    dim_y := data.offset.y
+
+    // Ensure minimum offset from points
+    MIN_OFFSET :: 0.3
+    mid_y := (p1.y + p2.y) * 0.5
+    if glsl.abs(dim_y - mid_y) < MIN_OFFSET {
+        dim_y = mid_y + MIN_OFFSET * glsl.sign(dim_y - mid_y)
+        if dim_y == mid_y {
+            dim_y = mid_y + MIN_OFFSET
+        }
+    }
+
+    // Dimension line endpoints (horizontal)
+    dim1_2d := m.Vec2{p1.x, dim_y}
+    dim2_2d := m.Vec2{p2.x, dim_y}
+
+    dim1_3d := sketch.sketch_to_world(&sk.plane, dim1_2d)
+    dim2_3d := sketch.sketch_to_world(&sk.plane, dim2_2d)
+
+    // Build dimension lines
+    dim_lines := make([dynamic][2][3]f32, context.temp_allocator)
+
+    // Vertical extension line from p1 to dimension line
+    p1_3d := sketch.sketch_to_world(&sk.plane, p1_2d)
+    append(&dim_lines, [2][3]f32{
+        {f32(p1_3d.x), f32(p1_3d.y), f32(p1_3d.z)},
+        {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
+    })
+
+    // Vertical extension line from p2 to dimension line
+    p2_3d := sketch.sketch_to_world(&sk.plane, p2_2d)
+    append(&dim_lines, [2][3]f32{
+        {f32(p2_3d.x), f32(p2_3d.y), f32(p2_3d.z)},
+        {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+    })
+
+    // Calculate text width for gap
+    text_size: f32 = 20
+    text_width_world: f64 = 0.5
+    text_width_pixels: f32 = 0
+    text_height_pixels: f32 = 0
+
+    if text_renderer != nil {
+        dist_text := fmt.tprintf("%.2f", math.abs(data.distance))
+        text_width_pixels, text_height_pixels = text_measure_gpu(text_renderer, dist_text, text_size)
+
+        viewport_height := f32(viewer.window_height)
+        fov_radians := math.to_radians(viewer.camera.fov)
+        pixel_size_world := f64((2.0 * viewer.camera.distance * math.tan(fov_radians * 0.5)) / viewport_height)
+        text_width_world = f64(text_width_pixels) * pixel_size_world * 1.8
+    }
+
+    // Calculate gap positions (centered on X midpoint)
+    mid_x := (p1.x + p2.x) * 0.5
+    gap_half := text_width_world * 0.5
+    gap_start_2d := m.Vec2{mid_x - gap_half, dim_y}
+    gap_end_2d := m.Vec2{mid_x + gap_half, dim_y}
+
+    // Dimension line with gap (split into two segments)
+    if glsl.abs(gap_start_2d.x - dim1_2d.x) > 0.01 {
+        gap_start_3d := sketch.sketch_to_world(&sk.plane, gap_start_2d)
+        append(&dim_lines, [2][3]f32{
+            {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
+            {f32(gap_start_3d.x), f32(gap_start_3d.y), f32(gap_start_3d.z)},
+        })
+    }
+
+    if glsl.abs(dim2_2d.x - gap_end_2d.x) > 0.01 {
+        gap_end_3d := sketch.sketch_to_world(&sk.plane, gap_end_2d)
+        append(&dim_lines, [2][3]f32{
+            {f32(gap_end_3d.x), f32(gap_end_3d.y), f32(gap_end_3d.z)},
+            {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+        })
+    }
+
+    // Arrow heads (horizontal direction)
+    // Calculate actual direction from dim1 to dim2
+    dim_vec := dim2_2d - dim1_2d
+    dim_len := glsl.length(dim_vec)
+    dim_dir := m.Vec2{1.0, 0.0}
+    if dim_len > 0.001 {
+        dim_dir = dim_vec / dim_len
+    }
+
+    ARROW_SIZE :: 0.15
+    ARROW_ANGLE :: 30.0
+
+    arrow_lines := render_dimension_arrow_heads(sk, dim1_2d, dim2_2d, dim_dir, ARROW_SIZE, ARROW_ANGLE)
+    for arrow_line in arrow_lines {
+        append(&dim_lines, arrow_line)
+    }
+
+    // Draw dimension lines
+    dim_color := is_selected ? [4]f32{1.0, 1.0, 1.0, 1.0} : [4]f32{1.0, 1.0, 0.0, 1.0}
+    viewer_gpu_render_thick_lines(viewer, cmd, pass, dim_lines[:], dim_color, mvp, 1.5)
+
+    // Render dimension text
+    if text_renderer != nil {
+        mid_dim_3d := (dim1_3d + dim2_3d) * 0.5
+        clip_pos := proj * view * glsl.vec4{f32(mid_dim_3d.x), f32(mid_dim_3d.y), f32(mid_dim_3d.z), 1.0}
+
+        if clip_pos.w != 0.0 {
+            ndc := clip_pos.xyz / clip_pos.w
+            screen_x := (ndc.x + 1.0) * 0.5 * f32(viewer.window_width)
+            screen_y := (1.0 - ndc.y) * 0.5 * f32(viewer.window_height)
+
+            dist_text := fmt.tprintf("%.2f", math.abs(data.distance))
+            text_offset_x := text_width_pixels * 0.5
+            text_offset_y := text_height_pixels * 0.5
+
+            text_color := is_selected ? [4]u8{255, 255, 255, 255} : [4]u8{255, 255, 0, 255}
+            text_render_2d_gpu(text_renderer, cmd, pass, dist_text, screen_x - text_offset_x, screen_y - text_offset_y, text_size, text_color, viewer.window_width, viewer.window_height)
+        }
+    }
+}
+
+// Render vertical distance dimension (DistanceY) - measures Y-axis distance
+render_distance_y_dimension_gpu :: proc(
+    viewer: ^ViewerGPU,
+    cmd: ^sdl.GPUCommandBuffer,
+    pass: ^sdl.GPURenderPass,
+    text_renderer: ^TextRendererGPU,
+    sk: ^sketch.Sketch2D,
+    data: sketch.DistanceYData,
+    mvp: matrix[4,4]f32,
+    view: matrix[4,4]f32,
+    proj: matrix[4,4]f32,
+    is_selected: bool,
+    document_settings: ^doc.DocumentSettings = nil,  // NEW: For unit formatting
+) {
+    if data.point1_id < 0 || data.point1_id >= len(sk.points) do return
+    if data.point2_id < 0 || data.point2_id >= len(sk.points) do return
+
+    p1 := sketch.sketch_get_point(sk, data.point1_id)
+    p2 := sketch.sketch_get_point(sk, data.point2_id)
+    if p1 == nil || p2 == nil do return
+
+    p1_2d := m.Vec2{p1.x, p1.y}
+    p2_2d := m.Vec2{p2.x, p2.y}
+
+    // Vertical dimension: measure Y distance
+    // Dimension line is vertical, perpendicular extensions are horizontal
+
+    // Get X position from offset
+    dim_x := data.offset.x
+
+    // Ensure minimum offset from points
+    MIN_OFFSET :: 0.3
+    mid_x := (p1.x + p2.x) * 0.5
+    if glsl.abs(dim_x - mid_x) < MIN_OFFSET {
+        dim_x = mid_x + MIN_OFFSET * glsl.sign(dim_x - mid_x)
+        if dim_x == mid_x {
+            dim_x = mid_x + MIN_OFFSET
+        }
+    }
+
+    // Dimension line endpoints (vertical)
+    dim1_2d := m.Vec2{dim_x, p1.y}
+    dim2_2d := m.Vec2{dim_x, p2.y}
+
+    dim1_3d := sketch.sketch_to_world(&sk.plane, dim1_2d)
+    dim2_3d := sketch.sketch_to_world(&sk.plane, dim2_2d)
+
+    // Build dimension lines
+    dim_lines := make([dynamic][2][3]f32, context.temp_allocator)
+
+    // Horizontal extension line from p1 to dimension line
+    p1_3d := sketch.sketch_to_world(&sk.plane, p1_2d)
+    append(&dim_lines, [2][3]f32{
+        {f32(p1_3d.x), f32(p1_3d.y), f32(p1_3d.z)},
+        {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
+    })
+
+    // Horizontal extension line from p2 to dimension line
+    p2_3d := sketch.sketch_to_world(&sk.plane, p2_2d)
+    append(&dim_lines, [2][3]f32{
+        {f32(p2_3d.x), f32(p2_3d.y), f32(p2_3d.z)},
+        {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+    })
+
+    // Calculate text width for gap
+    text_size: f32 = 20
+    text_width_world: f64 = 0.5
+    text_width_pixels: f32 = 0
+    text_height_pixels: f32 = 0
+
+    if text_renderer != nil {
+        dist_text := fmt.tprintf("%.2f", math.abs(data.distance))
+        text_width_pixels, text_height_pixels = text_measure_gpu(text_renderer, dist_text, text_size)
+
+        viewport_height := f32(viewer.window_height)
+        fov_radians := math.to_radians(viewer.camera.fov)
+        pixel_size_world := f64((2.0 * viewer.camera.distance * math.tan(fov_radians * 0.5)) / viewport_height)
+        text_width_world = f64(text_width_pixels) * pixel_size_world * 1.8
+    }
+
+    // Calculate gap positions (centered on Y midpoint)
+    mid_y := (p1.y + p2.y) * 0.5
+    gap_half := text_width_world * 0.5
+    gap_start_2d := m.Vec2{dim_x, mid_y - gap_half}
+    gap_end_2d := m.Vec2{dim_x, mid_y + gap_half}
+
+    // Dimension line with gap (split into two segments)
+    if glsl.abs(gap_start_2d.y - dim1_2d.y) > 0.01 {
+        gap_start_3d := sketch.sketch_to_world(&sk.plane, gap_start_2d)
+        append(&dim_lines, [2][3]f32{
+            {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
+            {f32(gap_start_3d.x), f32(gap_start_3d.y), f32(gap_start_3d.z)},
+        })
+    }
+
+    if glsl.abs(dim2_2d.y - gap_end_2d.y) > 0.01 {
+        gap_end_3d := sketch.sketch_to_world(&sk.plane, gap_end_2d)
+        append(&dim_lines, [2][3]f32{
+            {f32(gap_end_3d.x), f32(gap_end_3d.y), f32(gap_end_3d.z)},
+            {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+        })
+    }
+
+    // Arrow heads (vertical direction)
+    // Calculate actual direction from dim1 to dim2
+    dim_vec := dim2_2d - dim1_2d
+    dim_len := glsl.length(dim_vec)
+    dim_dir := m.Vec2{0.0, 1.0}
+    if dim_len > 0.001 {
+        dim_dir = dim_vec / dim_len
+    }
+
+    ARROW_SIZE :: 0.15
+    ARROW_ANGLE :: 30.0
+
+    arrow_lines := render_dimension_arrow_heads(sk, dim1_2d, dim2_2d, dim_dir, ARROW_SIZE, ARROW_ANGLE)
+    for arrow_line in arrow_lines {
+        append(&dim_lines, arrow_line)
+    }
+
+    // Draw dimension lines
+    dim_color := is_selected ? [4]f32{1.0, 1.0, 1.0, 1.0} : [4]f32{1.0, 1.0, 0.0, 1.0}
+    viewer_gpu_render_thick_lines(viewer, cmd, pass, dim_lines[:], dim_color, mvp, 1.5)
+
+    // Render dimension text
+    if text_renderer != nil {
+        mid_dim_3d := (dim1_3d + dim2_3d) * 0.5
+        clip_pos := proj * view * glsl.vec4{f32(mid_dim_3d.x), f32(mid_dim_3d.y), f32(mid_dim_3d.z), 1.0}
+
+        if clip_pos.w != 0.0 {
+            ndc := clip_pos.xyz / clip_pos.w
+            screen_x := (ndc.x + 1.0) * 0.5 * f32(viewer.window_width)
+            screen_y := (1.0 - ndc.y) * 0.5 * f32(viewer.window_height)
+
+            dist_text := fmt.tprintf("%.2f", math.abs(data.distance))
+            text_offset_x := text_width_pixels * 0.5
+            text_offset_y := text_height_pixels * 0.5
+
+            text_color := is_selected ? [4]u8{255, 255, 255, 255} : [4]u8{255, 255, 0, 255}
+            text_render_2d_gpu(text_renderer, cmd, pass, dist_text, screen_x - text_offset_x, screen_y - text_offset_y, text_size, text_color, viewer.window_width, viewer.window_height)
+        }
+    }
+}
+
+// Render angular dimension with arc and angle text
+render_angular_dimension_gpu :: proc(
+    viewer: ^ViewerGPU,
+    cmd: ^sdl.GPUCommandBuffer,
+    pass: ^sdl.GPURenderPass,
+    text_renderer: ^TextRendererGPU,
+    sk: ^sketch.Sketch2D,
+    data: sketch.AngleData,
+    mvp: matrix[4,4]f32,
+    view: matrix[4,4]f32,
+    proj: matrix[4,4]f32,
+    is_selected: bool,
+) {
+    if data.line1_id < 0 || data.line1_id >= len(sk.entities) do return
+    if data.line2_id < 0 || data.line2_id >= len(sk.entities) do return
+
+    entity1 := sk.entities[data.line1_id]
+    entity2 := sk.entities[data.line2_id]
+
+    line1, ok1 := entity1.(sketch.SketchLine)
+    line2, ok2 := entity2.(sketch.SketchLine)
+    if !ok1 || !ok2 do return
+
+    p1_start := sketch.sketch_get_point(sk, line1.start_id)
+    p1_end := sketch.sketch_get_point(sk, line1.end_id)
+    p2_start := sketch.sketch_get_point(sk, line2.start_id)
+    p2_end := sketch.sketch_get_point(sk, line2.end_id)
+
+    if p1_start == nil || p1_end == nil || p2_start == nil || p2_end == nil do return
+
+    p1_start_2d := m.Vec2{p1_start.x, p1_start.y}
+    p1_end_2d := m.Vec2{p1_end.x, p1_end.y}
+    p2_start_2d := m.Vec2{p2_start.x, p2_start.y}
+    p2_end_2d := m.Vec2{p2_end.x, p2_end.y}
+
+    // Find shared corner (intersection point)
+    center_2d: m.Vec2
+    EPSILON :: 0.001
+
+    if glsl.length(p1_start_2d - p2_start_2d) < EPSILON {
+        center_2d = p1_start_2d
+    } else if glsl.length(p1_start_2d - p2_end_2d) < EPSILON {
+        center_2d = p1_start_2d
+    } else if glsl.length(p1_end_2d - p2_start_2d) < EPSILON {
+        center_2d = p1_end_2d
+    } else if glsl.length(p1_end_2d - p2_end_2d) < EPSILON {
+        center_2d = p1_end_2d
+    } else {
+        return
+    }
+
+    // Calculate direction vectors from shared corner
+    v1 := p1_end_2d - p1_start_2d
+    v2 := p2_end_2d - p2_start_2d
+
+    len_v1 := glsl.length(v1)
+    len_v2 := glsl.length(v2)
+
+    if len_v1 < 1e-10 || len_v2 < 1e-10 do return
+
+    v1 = v1 / len_v1
+    v2 = v2 / len_v2
+
+    // Determine which direction each line points FROM the shared corner
+    v1_from_corner := v1
+    v2_from_corner := v2
+
+    dist_to_p1_start := glsl.length(center_2d - p1_start_2d)
+    dist_to_p1_end := glsl.length(center_2d - p1_end_2d)
+
+    if dist_to_p1_start < 0.001 {
+        v1_from_corner = v1
+    } else if dist_to_p1_end < 0.001 {
+        v1_from_corner = -v1
+    }
+
+    dist_to_p2_start := glsl.length(center_2d - p2_start_2d)
+    dist_to_p2_end := glsl.length(center_2d - p2_end_2d)
+
+    if dist_to_p2_start < 0.001 {
+        v2_from_corner = v2
+    } else if dist_to_p2_end < 0.001 {
+        v2_from_corner = -v2
+    }
+
+    // Calculate arc radius based on offset position
+    to_offset := data.offset - center_2d
+    radius := glsl.length(to_offset)
+
+    MIN_RADIUS :: 0.3
+    MAX_RADIUS :: 3.0
+    radius = glsl.clamp(radius, MIN_RADIUS, MAX_RADIUS)
+
+    // Calculate angles for the edge directions (same quadrant logic as preview)
+    a1 := math.atan2(f64(v1_from_corner.y), f64(v1_from_corner.x))
+    a2 := math.atan2(f64(v2_from_corner.y), f64(v2_from_corner.x))
+    a1_neg := a1 + math.PI
+    a2_neg := a2 + math.PI
+    a_cursor := math.atan2(f64(to_offset.y), f64(to_offset.x))
+
+    // Normalize all angles to [0, 2π]
+    normalize_angle :: proc(a: f64) -> f64 {
+        result := a
+        for result < 0 do result += 2.0 * math.PI
+        for result >= 2.0 * math.PI do result -= 2.0 * math.PI
+        return result
+    }
+
+    a1 = normalize_angle(a1)
+    a2 = normalize_angle(a2)
+    a1_neg = normalize_angle(a1_neg)
+    a2_neg = normalize_angle(a2_neg)
+    a_cursor = normalize_angle(a_cursor)
+
+    // Determine which pair of vectors to use for the arc
+    arc_start, arc_end: f64
+
+    // Test all 4 possible arcs - test if cursor is in CCW arc from start to end
+    {
+        sweep := a2 - a1
+        if sweep < 0 do sweep += 2.0 * math.PI
+        offset := a_cursor - a1
+        if offset < 0 do offset += 2.0 * math.PI
+        if offset <= sweep {
+            arc_start = a1
+            arc_end = a2
+        } else {
+            sweep2 := a1_neg - a2
+            if sweep2 < 0 do sweep2 += 2.0 * math.PI
+            offset2 := a_cursor - a2
+            if offset2 < 0 do offset2 += 2.0 * math.PI
+            if offset2 <= sweep2 {
+                arc_start = a2
+                arc_end = a1_neg
+            } else {
+                sweep3 := a2_neg - a1_neg
+                if sweep3 < 0 do sweep3 += 2.0 * math.PI
+                offset3 := a_cursor - a1_neg
+                if offset3 < 0 do offset3 += 2.0 * math.PI
+                if offset3 <= sweep3 {
+                    arc_start = a1_neg
+                    arc_end = a2_neg
+                } else {
+                    arc_start = a2_neg
+                    arc_end = a1
+                }
+            }
+        }
+    }
+
+    // Calculate CCW sweep angle
+    start_angle := arc_start
+    sweep_angle := arc_end - arc_start
+    if sweep_angle < 0 do sweep_angle += 2.0 * math.PI
+
+    // Tessellate arc into line segments (24 segments for smooth arc)
+    segments := 24
+    arc_lines := make([dynamic][2][3]f32, context.temp_allocator)
+
+    for i in 0..<segments {
+        t0 := f64(i) / f64(segments)
+        t1 := f64(i + 1) / f64(segments)
+
+        angle0 := start_angle + sweep_angle * t0
+        angle1 := start_angle + sweep_angle * t1
+
+        p0_2d := center_2d + m.Vec2{radius * math.cos(angle0), radius * math.sin(angle0)}
+        p1_2d := center_2d + m.Vec2{radius * math.cos(angle1), radius * math.sin(angle1)}
+
+        p0_3d := sketch.sketch_to_world(&sk.plane, p0_2d)
+        p1_3d := sketch.sketch_to_world(&sk.plane, p1_2d)
+
+        append(&arc_lines, [2][3]f32{
+            {f32(p0_3d.x), f32(p0_3d.y), f32(p0_3d.z)},
+            {f32(p1_3d.x), f32(p1_3d.y), f32(p1_3d.z)},
+        })
+    }
+
+    // Draw arc in bright yellow (or white if selected)
+    arc_color := is_selected ? [4]f32{1.0, 1.0, 1.0, 1.0} : [4]f32{1.0, 1.0, 0.0, 1.0}
+    viewer_gpu_render_thick_lines(viewer, cmd, pass, arc_lines[:], arc_color, mvp, 1.5)
+
+    // Render angle text value
+    if text_renderer != nil {
+        // Calculate midpoint of arc in 3D
+        mid_angle := start_angle + sweep_angle * 0.5
+        mid_radius := radius * 1.3
+        mid_2d := center_2d + m.Vec2{mid_radius * math.cos(mid_angle), mid_radius * math.sin(mid_angle)}
+        mid_3d := sketch.sketch_to_world(&sk.plane, mid_2d)
+
+        // Project 3D midpoint to screen space
+        clip_pos := proj * view * glsl.vec4{f32(mid_3d.x), f32(mid_3d.y), f32(mid_3d.z), 1.0}
+
+        if clip_pos.w != 0.0 {
+            ndc := clip_pos.xyz / clip_pos.w
+            screen_x := (ndc.x + 1.0) * 0.5 * f32(viewer.window_width)
+            screen_y := (1.0 - ndc.y) * 0.5 * f32(viewer.window_height)
+
+            // Format angle value as string (data.angle is already in degrees)
+            angle_text := fmt.tprintf("%.1f°", data.angle)
+
+            // Render text at screen position (bright yellow to match arc)
+            text_color := is_selected ? [4]u8{255, 255, 255, 255} : [4]u8{255, 255, 0, 255}
+            text_render_2d_gpu(text_renderer, cmd, pass, angle_text, screen_x, screen_y, 16, text_color, viewer.window_width, viewer.window_height)
+        }
+    }
 }
 
 // =============================================================================
@@ -1651,6 +2748,10 @@ viewer_gpu_init :: proc(config: ViewerGPUConfig = DEFAULT_GPU_CONFIG) -> (^Viewe
     }
 
     fmt.println("✓ Window created")
+
+    // macOS: Raise window and give it keyboard focus
+    _ = sdl.RaiseWindow(window)
+    _ = sdl.SetWindowKeyboardGrab(window, true)
 
     // Create GPU device (Metal on macOS)
     gpu_device := sdl.CreateGPUDevice(
@@ -1779,6 +2880,10 @@ viewer_gpu_init :: proc(config: ViewerGPUConfig = DEFAULT_GPU_CONFIG) -> (^Viewe
             cull_mode = .NONE,
             front_face = .COUNTER_CLOCKWISE,
         },
+        multisample_state = {
+            sample_count = ._4,  // 4x MSAA for antialiasing
+            sample_mask = 0xFFFFFFFF,
+        },
         target_info = {
             num_color_targets = 1,
             color_target_descriptions = &color_target,
@@ -1823,6 +2928,10 @@ viewer_gpu_init :: proc(config: ViewerGPUConfig = DEFAULT_GPU_CONFIG) -> (^Viewe
             fill_mode = .FILL,
             cull_mode = .NONE,
             front_face = .COUNTER_CLOCKWISE,
+        },
+        multisample_state = {
+            sample_count = ._4,  // 4x MSAA for antialiasing
+            sample_mask = 0xFFFFFFFF,
         },
         depth_stencil_state = {
             // Disable depth testing for UI widgets - always render on top
@@ -2026,7 +3135,7 @@ viewer_gpu_init :: proc(config: ViewerGPUConfig = DEFAULT_GPU_CONFIG) -> (^Viewe
 // Create coordinate axes vertex buffer
 viewer_gpu_create_axes :: proc(viewer: ^ViewerGPU) -> bool {
     // Define axes vertices (X=red, Y=green, Z=blue)
-    axes_length: f32 = 5.0
+    axes_length: f32 = 3.0
 
     axes_vertices := []LineVertex{
         // X axis (red) - origin to +X
@@ -2358,18 +3467,18 @@ viewer_gpu_render_axes :: proc(viewer: ^ViewerGPU, cmd: ^sdl.GPUCommandBuffer, p
     axes_length: f32 = 5.0
 
     // Define axes as line segments
-    x_axis := [][2][3]f32{{{0, 0, 0}, {axes_length, 0, 0}}}
-    y_axis := [][2][3]f32{{{0, 0, 0}, {0, axes_length, 0}}}
-    z_axis := [][2][3]f32{{{0, 0, 0}, {0, 0, axes_length}}}
+    x_axis := [][2][3]f32{{{0-axes_length, 0, 0}, {axes_length, 0, 0}}}
+    y_axis := [][2][3]f32{{{0, 0, 0}, {0, 1.0, 0}}}
+    z_axis := [][2][3]f32{{{0, 0, -axes_length}, {0, 0, axes_length}}}
 
     // Render with thick lines (4 pixels wide for visibility)
-    thickness: f32 = 4.0
+    thickness: f32 = 2.0
 
     // X axis (red)
     viewer_gpu_render_thick_lines(viewer, cmd, pass, x_axis, {1.0, 0.0, 0.0, 1.0}, mvp, thickness)
 
     // Y axis (green)
-    viewer_gpu_render_thick_lines(viewer, cmd, pass, y_axis, {0.0, 1.0, 0.0, 1.0}, mvp, thickness)
+    viewer_gpu_render_thick_lines(viewer, cmd, pass, y_axis, {0.0, 1.0, 0.0, 1.0}, mvp, 1.0)
 
     // Z axis (blue)
     viewer_gpu_render_thick_lines(viewer, cmd, pass, z_axis, {0.0, 0.0, 1.0, 1.0}, mvp, thickness)
@@ -2835,6 +3944,118 @@ viewer_gpu_render_wireframe :: proc(
 }
 
 // =============================================================================
+// Inline Rectangle Rendering (for UI widgets in 3D space)
+// =============================================================================
+
+// Render a filled rectangle inline within current render pass (no GPU waits)
+// This is designed to work within an active render pass for UI widgets
+viewer_gpu_render_rect_inline :: proc(
+    viewer: ^ViewerGPU,
+    cmd: ^sdl.GPUCommandBuffer,
+    pass: ^sdl.GPURenderPass,
+    x, y, width, height: f32,
+    color: [4]f32,
+    screen_width, screen_height: u32,
+) {
+    // Convert screen space to NDC [-1, 1]
+    x_ndc := (2.0 * x) / f32(screen_width) - 1.0
+    y_ndc := 1.0 - (2.0 * y) / f32(screen_height)
+    width_ndc := (2.0 * width) / f32(screen_width)
+    height_ndc := (2.0 * height) / f32(screen_height)
+
+    // Create rectangle vertices (2 triangles forming a quad)
+    vertices := [6]LineVertex{
+        // First triangle (top-left, bottom-left, bottom-right)
+        {{x_ndc, y_ndc, 0}},
+        {{x_ndc, y_ndc - height_ndc, 0}},
+        {{x_ndc + width_ndc, y_ndc - height_ndc, 0}},
+        // Second triangle (top-left, bottom-right, top-right)
+        {{x_ndc, y_ndc, 0}},
+        {{x_ndc + width_ndc, y_ndc - height_ndc, 0}},
+        {{x_ndc + width_ndc, y_ndc, 0}},
+    }
+
+    // Create temporary vertex buffer
+    buffer_info := sdl.GPUBufferCreateInfo{
+        usage = {.VERTEX},
+        size = u32(len(vertices) * size_of(LineVertex)),
+    }
+
+    temp_vertex_buffer := sdl.CreateGPUBuffer(viewer.gpu_device, buffer_info)
+    if temp_vertex_buffer == nil do return
+    defer sdl.ReleaseGPUBuffer(viewer.gpu_device, temp_vertex_buffer)
+
+    // Upload vertex data
+    transfer_info := sdl.GPUTransferBufferCreateInfo{
+        usage = .UPLOAD,
+        size = u32(len(vertices) * size_of(LineVertex)),
+    }
+
+    transfer_buffer := sdl.CreateGPUTransferBuffer(viewer.gpu_device, transfer_info)
+    if transfer_buffer == nil do return
+    defer sdl.ReleaseGPUTransferBuffer(viewer.gpu_device, transfer_buffer)
+
+    transfer_ptr := sdl.MapGPUTransferBuffer(viewer.gpu_device, transfer_buffer, false)
+    if transfer_ptr == nil do return
+
+    dest_slice := ([^]LineVertex)(transfer_ptr)[:len(vertices)]
+    copy(dest_slice, vertices[:])
+    sdl.UnmapGPUTransferBuffer(viewer.gpu_device, transfer_buffer)
+
+    // Upload to GPU
+    upload_cmd := sdl.AcquireGPUCommandBuffer(viewer.gpu_device)
+    copy_pass := sdl.BeginGPUCopyPass(upload_cmd)
+
+    src := sdl.GPUTransferBufferLocation{
+        transfer_buffer = transfer_buffer,
+        offset = 0,
+    }
+
+    dst := sdl.GPUBufferRegion{
+        buffer = temp_vertex_buffer,
+        offset = 0,
+        size = u32(len(vertices) * size_of(LineVertex)),
+    }
+
+    sdl.UploadToGPUBuffer(copy_pass, src, dst, false)
+    sdl.EndGPUCopyPass(copy_pass)
+    _ = sdl.SubmitGPUCommandBuffer(upload_cmd)
+
+    // Wait for upload
+    _ = sdl.WaitForGPUIdle(viewer.gpu_device)
+
+    // Switch to triangle pipeline
+    sdl.BindGPUGraphicsPipeline(pass, viewer.triangle_pipeline)
+
+    // Bind vertex buffer
+    binding := sdl.GPUBufferBinding{
+        buffer = temp_vertex_buffer,
+        offset = 0,
+    }
+    sdl.BindGPUVertexBuffers(pass, 0, &binding, 1)
+
+    // Use identity matrix since we're already in NDC
+    identity := matrix[4,4]f32{
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    }
+
+    // Draw rectangle with color
+    uniforms := Uniforms{
+        mvp = identity,
+        color = color,
+    }
+    sdl.PushGPUVertexUniformData(cmd, 0, &uniforms, size_of(Uniforms))
+    sdl.PushGPUFragmentUniformData(cmd, 0, &uniforms, size_of(Uniforms))
+    sdl.DrawGPUPrimitives(pass, u32(len(vertices)), 1, 0, 0)
+
+    // Switch back to line pipeline
+    sdl.BindGPUGraphicsPipeline(pass, viewer.pipeline)
+}
+
+// =============================================================================
 // Triangle Mesh Rendering (Shaded with Lighting)
 // =============================================================================
 
@@ -2935,9 +4156,9 @@ viewer_gpu_render_triangle_mesh :: proc(
 
     // Set up lighting parameters
     // Light direction: from upper-right-front (balanced for CAD viewing)
-    // The shader negates this, so this vector points FROM the light source
+    // The shader negates this, so this vector points FROM the light source (use negative values!)
     light_dir := [3]f32{-0.4, -0.5, -0.3}  // Gentle angle from upper-right-front
-    ambient_strength: f32 = 0.4            // 40% ambient light (ensures no pure black faces)
+    ambient_strength: f32 = 0.6            // 60% ambient light + dual directional lights = great visibility
 
     // Create identity matrix for model transform
     model_matrix := matrix[4,4]f32{

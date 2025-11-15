@@ -7,8 +7,414 @@ import glsl "core:math/linalg/glsl"
 import v "../viewer"
 
 // =============================================================================
-// UI Context - Holds state for immediate-mode UI
+// Text Input Widget - Editable text field with selection
 // =============================================================================
+
+TextInputWidget :: struct {
+    active: bool,              // Is widget currently active/editing?
+    buffer: [128]u8,           // Text buffer
+    length: int,               // Current text length
+    cursor_pos: int,           // Cursor position
+    text_selected: bool,       // Is all text selected?
+
+    // Visual properties
+    x, y: f32,                 // Position
+    width, height: f32,        // Size
+    text_size: f32,            // Font size
+
+    // Colors
+    bg_color: [4]f32,          // Background color (with alpha)
+    text_color: [4]u8,         // Text color
+
+    // Padding
+    padding: f32,
+}
+
+// Create a new text input widget
+text_input_widget_create :: proc(
+    x, y, width, height: f32,
+    text_size: f32 = 28,
+    padding: f32 = 8,
+    bg_color: [4]f32 = {0.0, 0.0, 0.0, 0.9},
+    text_color: [4]u8 = {255, 255, 0, 255},
+) -> TextInputWidget {
+    return TextInputWidget{
+        active = false,
+        length = 0,
+        cursor_pos = 0,
+        text_selected = false,
+        x = x,
+        y = y,
+        width = width,
+        height = height,
+        text_size = text_size,
+        padding = padding,
+        bg_color = bg_color,
+        text_color = text_color,
+    }
+}
+
+// Start editing with initial text
+text_input_widget_start :: proc(widget: ^TextInputWidget, initial_text: string) {
+    widget.active = true
+    widget.length = min(len(initial_text), len(widget.buffer))
+    widget.cursor_pos = widget.length
+    widget.text_selected = true  // Select all on start
+
+    // Copy initial text to buffer
+    for i in 0..<widget.length {
+        widget.buffer[i] = initial_text[i]
+    }
+}
+
+// Stop editing
+text_input_widget_stop :: proc(widget: ^TextInputWidget) {
+    widget.active = false
+    widget.length = 0
+    widget.cursor_pos = 0
+    widget.text_selected = false
+}
+
+// Handle character input
+text_input_widget_handle_char :: proc(widget: ^TextInputWidget, ch: rune) -> bool {
+    if !widget.active do return false
+
+    // Only accept valid number characters (for now - can be extended later)
+    if !((ch >= '0' && ch <= '9') || ch == '.' || (ch == '-' && widget.length == 0)) {
+        return false
+    }
+
+    // If text is selected, replace it with new character
+    if widget.text_selected {
+        widget.length = 0
+        widget.cursor_pos = 0
+        widget.text_selected = false
+    }
+
+    // Insert character at cursor position
+    if widget.length < len(widget.buffer) - 1 {
+        // Shift characters to the right to make room for new character
+        for i := widget.length; i > widget.cursor_pos; i -= 1 {
+            widget.buffer[i] = widget.buffer[i - 1]
+        }
+
+        // Insert new character at cursor position
+        widget.buffer[widget.cursor_pos] = u8(ch)
+        widget.length += 1
+        widget.cursor_pos += 1  // Move cursor forward
+        return true
+    }
+
+    return false
+}
+
+// Handle backspace
+text_input_widget_handle_backspace :: proc(widget: ^TextInputWidget) -> bool {
+    if !widget.active do return false
+
+    if widget.text_selected {
+        // Delete all selected text
+        widget.length = 0
+        widget.cursor_pos = 0
+        widget.text_selected = false
+        return true
+    } else if widget.length > 0 {
+        // Delete single character
+        widget.length -= 1
+        widget.cursor_pos = widget.length
+        return true
+    }
+
+    return false
+}
+
+// Handle arrow keys (move cursor or deselect)
+text_input_widget_handle_arrow :: proc(widget: ^TextInputWidget, key: sdl.Keycode) -> bool {
+    if !widget.active do return false
+
+    // If text is selected, deselect and position cursor based on arrow direction
+    if widget.text_selected {
+        widget.text_selected = false
+
+        // Position cursor based on arrow direction
+        switch key {
+        case sdl.K_LEFT, sdl.K_HOME:
+            widget.cursor_pos = 0  // Move to start
+        case sdl.K_RIGHT, sdl.K_END:
+            widget.cursor_pos = widget.length  // Move to end
+        }
+        return true
+    }
+
+    // Move cursor based on arrow key
+    switch key {
+    case sdl.K_LEFT:
+        if widget.cursor_pos > 0 {
+            widget.cursor_pos -= 1
+        }
+        return true
+
+    case sdl.K_RIGHT:
+        if widget.cursor_pos < widget.length {
+            widget.cursor_pos += 1
+        }
+        return true
+
+    case sdl.K_HOME:
+        widget.cursor_pos = 0
+        return true
+
+    case sdl.K_END:
+        widget.cursor_pos = widget.length
+        return true
+    }
+
+    return false
+}
+
+// Get current text
+text_input_widget_get_text :: proc(widget: ^TextInputWidget) -> string {
+    if widget.length == 0 do return ""
+    return string(widget.buffer[:widget.length])
+}
+
+// Render the widget in 2D UI layer (uses ui_render_rect)
+text_input_widget_render :: proc(
+    widget: ^TextInputWidget,
+    ctx: ^UIContext,
+) {
+    if !widget.active do return
+
+    // Convert background color from [4]f32 to [4]u8
+    bg_color_u8 := [4]u8{
+        u8(widget.bg_color.r * 255.0),
+        u8(widget.bg_color.g * 255.0),
+        u8(widget.bg_color.b * 255.0),
+        u8(widget.bg_color.a * 255.0),
+    }
+
+    // Render background box using ui_render_rect (works within current render pass)
+    ui_render_rect(ctx, widget.x, widget.y, widget.width, widget.height, bg_color_u8)
+
+    // Render border (matching other widgets)
+    border_color := [4]u8{0, 200, 200, 255}  // Cyan accent
+    border_width: f32 = 2.0
+
+    // Top border
+    ui_render_rect(ctx, widget.x, widget.y, widget.width, border_width, border_color)
+    // Bottom border
+    ui_render_rect(ctx, widget.x, widget.y + widget.height - border_width, widget.width, border_width, border_color)
+    // Left border
+    ui_render_rect(ctx, widget.x, widget.y, border_width, widget.height, border_color)
+    // Right border
+    ui_render_rect(ctx, widget.x + widget.width - border_width, widget.y, border_width, widget.height, border_color)
+
+    // Get current text
+    text_to_display := text_input_widget_get_text(widget)
+
+    // Build display string with cursor at correct position
+    display_with_cursor := _build_display_text_with_cursor(widget, text_to_display)
+
+    // Render text centered in box
+    text_width, text_height := ui_measure_text(ctx, display_with_cursor, widget.text_size)
+    text_x := widget.x + (widget.width - text_width) * 0.5
+    text_y := widget.y + (widget.height - text_height) * 0.5
+
+    ui_render_text(ctx, display_with_cursor, text_x, text_y, widget.text_size, widget.text_color)
+}
+
+// Render the widget in 3D overlay (for dimension editing in 3D view)
+// WORKAROUND: Use render_filled_rect_2d helper to avoid GPU sync issues
+text_input_widget_render_3d :: proc(
+    widget: ^TextInputWidget,
+    viewer: ^v.ViewerGPU,
+    text_renderer: ^v.TextRendererGPU,
+    cmd: ^sdl.GPUCommandBuffer,
+    pass: ^sdl.GPURenderPass,
+    screen_width, screen_height: u32,
+) {
+    if !widget.active do return
+
+    // Create UIContext wrapper to use render_filled_rect_2d helper
+    ctx := UIContext{
+        viewer = viewer,
+        text_renderer = text_renderer,
+        cmd = cmd,
+        pass = pass,
+        screen_width = screen_width,
+        screen_height = screen_height,
+    }
+
+    // Convert background color from [4]f32 to [4]u8
+    bg_color_u8 := [4]u8{
+        u8(widget.bg_color.r * 255.0),
+        u8(widget.bg_color.g * 255.0),
+        u8(widget.bg_color.b * 255.0),
+        u8(widget.bg_color.a * 255.0),
+    }
+
+    // Render background box using render_filled_rect_2d (works!)
+    render_filled_rect_2d(&ctx, widget.x, widget.y, widget.width, widget.height, widget.bg_color)
+
+    // Render cyan border (2px)
+    border_width: f32 = 2.0
+    border_color := [4]f32{0.0, 200.0/255.0, 200.0/255.0, 1.0}
+
+    // Top border
+    render_filled_rect_2d(&ctx, widget.x, widget.y, widget.width, border_width, border_color)
+    // Bottom border
+    render_filled_rect_2d(&ctx, widget.x, widget.y + widget.height - border_width, widget.width, border_width, border_color)
+    // Left border
+    render_filled_rect_2d(&ctx, widget.x, widget.y, border_width, widget.height, border_color)
+    // Right border
+    render_filled_rect_2d(&ctx, widget.x + widget.width - border_width, widget.y, border_width, widget.height, border_color)
+
+    // Get text from widget with cursor
+    text_to_display := text_input_widget_get_text(widget)
+    display_with_cursor := _build_display_text_with_cursor(widget, text_to_display)
+
+    // Render text centered in box
+    text_width, text_height := v.text_measure_gpu(text_renderer, display_with_cursor, widget.text_size)
+    text_x := widget.x + (widget.width - text_width) * 0.5
+    text_y := widget.y + (widget.height - text_height) * 0.5
+    v.text_render_2d_gpu(text_renderer, cmd, pass, display_with_cursor, text_x, text_y, widget.text_size, widget.text_color, screen_width, screen_height)
+}
+
+// Helper: Build display text with cursor at correct position
+_build_display_text_with_cursor :: proc(widget: ^TextInputWidget, text: string) -> string {
+    if widget.text_selected {
+        // When text is selected, show it all highlighted (no cursor)
+        return text
+    } else if widget.length == 0 {
+        // Empty - just show cursor
+        return "|"
+    } else {
+        // Insert cursor at cursor_pos
+        if widget.cursor_pos == 0 {
+            return fmt.tprintf("|%s", text)
+        } else if widget.cursor_pos >= widget.length {
+            return fmt.tprintf("%s|", text)
+        } else {
+            // Cursor in middle
+            before := text[:widget.cursor_pos]
+            after := text[widget.cursor_pos:]
+            return fmt.tprintf("%s|%s", before, after)
+        }
+    }
+}
+
+// Helper: Render filled rectangle in screen space (2D overlay)
+// This is IDENTICAL to render_filled_rect_gpu in main_gpu.odin which WORKS
+render_filled_rect_2d :: proc(
+    ctx: ^UIContext,
+    x, y, width, height: f32,
+    color: [4]f32,
+) {
+    // Convert screen space to NDC [-1, 1]
+    x_ndc := (2.0 * x) / f32(ctx.screen_width) - 1.0
+    y_ndc := 1.0 - (2.0 * y) / f32(ctx.screen_height)
+    width_ndc := (2.0 * width) / f32(ctx.screen_width)
+    height_ndc := (2.0 * height) / f32(ctx.screen_height)
+
+    // Create rectangle vertices (2 triangles forming a quad)
+    vertices := [6]v.LineVertex{
+        // First triangle (top-left, bottom-left, bottom-right)
+        {{x_ndc, y_ndc, 0}},
+        {{x_ndc, y_ndc - height_ndc, 0}},
+        {{x_ndc + width_ndc, y_ndc - height_ndc, 0}},
+        // Second triangle (top-left, bottom-right, top-right)
+        {{x_ndc, y_ndc, 0}},
+        {{x_ndc + width_ndc, y_ndc - height_ndc, 0}},
+        {{x_ndc + width_ndc, y_ndc, 0}},
+    }
+
+    // Create temporary vertex buffer
+    buffer_info := sdl.GPUBufferCreateInfo{
+        usage = {.VERTEX},
+        size = u32(len(vertices) * size_of(v.LineVertex)),
+    }
+
+    temp_vertex_buffer := sdl.CreateGPUBuffer(ctx.viewer.gpu_device, buffer_info)
+    if temp_vertex_buffer == nil {
+        fmt.eprintln("ERROR: Failed to create rect vertex buffer")
+        return
+    }
+    defer sdl.ReleaseGPUBuffer(ctx.viewer.gpu_device, temp_vertex_buffer)
+
+    // Upload vertex data
+    transfer_info := sdl.GPUTransferBufferCreateInfo{
+        usage = .UPLOAD,
+        size = u32(len(vertices) * size_of(v.LineVertex)),
+    }
+
+    transfer_buffer := sdl.CreateGPUTransferBuffer(ctx.viewer.gpu_device, transfer_info)
+    if transfer_buffer == nil do return
+    defer sdl.ReleaseGPUTransferBuffer(ctx.viewer.gpu_device, transfer_buffer)
+
+    transfer_ptr := sdl.MapGPUTransferBuffer(ctx.viewer.gpu_device, transfer_buffer, false)
+    if transfer_ptr == nil do return
+
+    dest_slice := ([^]v.LineVertex)(transfer_ptr)[:len(vertices)]
+    copy(dest_slice, vertices[:])
+    sdl.UnmapGPUTransferBuffer(ctx.viewer.gpu_device, transfer_buffer)
+
+    // Upload to GPU
+    upload_cmd := sdl.AcquireGPUCommandBuffer(ctx.viewer.gpu_device)
+    copy_pass := sdl.BeginGPUCopyPass(upload_cmd)
+
+    src := sdl.GPUTransferBufferLocation{
+        transfer_buffer = transfer_buffer,
+        offset = 0,
+    }
+
+    dst := sdl.GPUBufferRegion{
+        buffer = temp_vertex_buffer,
+        offset = 0,
+        size = u32(len(vertices) * size_of(v.LineVertex)),
+    }
+
+    sdl.UploadToGPUBuffer(copy_pass, src, dst, false)
+    sdl.EndGPUCopyPass(copy_pass)
+    _ = sdl.SubmitGPUCommandBuffer(upload_cmd)
+
+    // Wait for upload
+    _ = sdl.WaitForGPUIdle(ctx.viewer.gpu_device)
+
+    // Switch to triangle pipeline
+    sdl.BindGPUGraphicsPipeline(ctx.pass, ctx.viewer.triangle_pipeline)
+
+    // Bind vertex buffer
+    binding := sdl.GPUBufferBinding{
+        buffer = temp_vertex_buffer,
+        offset = 0,
+    }
+    sdl.BindGPUVertexBuffers(ctx.pass, 0, &binding, 1)
+
+    // Use identity matrix since we're already in NDC
+    identity := matrix[4,4]f32{
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    }
+
+    // Draw rectangle with color
+    uniforms := v.Uniforms{
+        mvp = identity,
+        color = color,
+    }
+    sdl.PushGPUVertexUniformData(ctx.cmd, 0, &uniforms, size_of(v.Uniforms))
+    sdl.PushGPUFragmentUniformData(ctx.cmd, 0, &uniforms, size_of(v.Uniforms))
+    sdl.DrawGPUPrimitives(ctx.pass, u32(len(vertices)), 1, 0, 0)
+
+    // Switch back to line pipeline
+    sdl.BindGPUGraphicsPipeline(ctx.pass, ctx.viewer.pipeline)
+}
+
+// =============================================================================
+// End of Text Input Widget
+// =============================================================================
+
 
 UIContext :: struct {
     // Rendering resources
@@ -25,6 +431,7 @@ UIContext :: struct {
     mouse_x: f32,
     mouse_y: f32,
     mouse_down: bool,
+    mouse_down_prev: bool,  // Previous frame mouse state for click detection
     mouse_clicked: bool,  // True for one frame after mouse up
 
     // Widget ID tracking (for hover/active states)
@@ -34,6 +441,10 @@ UIContext :: struct {
 
     // UI interaction blocking
     mouse_over_ui: bool,  // True if mouse is over any UI element this frame
+
+    // Feature tree interaction
+    feature_tree_click_id: int,  // ID of feature clicked in tree (-1 if none)
+    checkmark_clicked: bool,     // True if checkmark button was clicked (finish editing)
 
     // Style
     style: UIStyle,
@@ -109,6 +520,7 @@ ui_begin_frame :: proc(
 
     // Detect click (mouse was down last frame, now up)
     ctx.mouse_clicked = !mouse_down && ctx.mouse_down
+    ctx.mouse_down_prev = ctx.mouse_down  // Store previous state before updating
     ctx.mouse_down = mouse_down
 
     // Reset ID counter
@@ -452,6 +864,49 @@ ui_toggle :: proc(
     ui_render_rect(ctx, handle_x, handle_y, handle_size, handle_size, handle_color)
 
     return changed
+}
+
+// =============================================================================
+// Widget 11: Button (Colored button with text label)
+// =============================================================================
+
+ui_button :: proc(
+    ctx: ^UIContext,
+    x, y, width, height: f32,
+    label: string,
+    normal_color: [4]u8,
+    hover_color: [4]u8,
+) -> bool {
+    is_hot := ui_point_in_rect(ctx.mouse_x, ctx.mouse_y, x, y, width, height)
+
+    if is_hot {
+        ctx.mouse_over_ui = true
+    }
+
+    // Choose color based on hover state
+    bg_color := is_hot ? hover_color : normal_color
+
+    // Draw button background
+    ui_render_rect(ctx, x, y, width, height, bg_color)
+
+    // Draw button border
+    border_color := ctx.style.bg_light
+    border_width: f32 = 1.0
+    ui_render_rect(ctx, x, y, width, border_width, border_color)
+    ui_render_rect(ctx, x, y + height - border_width, width, border_width, border_color)
+    ui_render_rect(ctx, x, y, border_width, height, border_color)
+    ui_render_rect(ctx, x + width - border_width, y, border_width, height, border_color)
+
+    // Render button text (centered)
+    text_width, text_height := ui_measure_text(ctx, label, ctx.style.font_size_small)
+    text_x := x + (width - text_width) * 0.5
+    text_y := y + (height - text_height) * 0.5
+    ui_render_text(ctx, label, text_x, text_y, ctx.style.font_size_small, {255, 255, 255, 255})  // White text
+
+    // Check for click
+    clicked := is_hot && ctx.mouse_down && !ctx.mouse_down_prev
+
+    return clicked
 }
 
 // =============================================================================

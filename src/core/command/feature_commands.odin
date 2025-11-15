@@ -38,16 +38,14 @@ ModifyFeatureCommand :: struct {
 // AddFeatureCommand Operations
 // =============================================================================
 
-add_feature_command_execute :: proc(cmd: AddFeatureCommand) -> bool {
-    cmd_mut := cmd
-
+add_feature_command_execute :: proc(cmd: ^AddFeatureCommand) -> bool {
     // Add feature based on type
     switch cmd.feature_type {
     case .Sketch:
         #partial switch params in cmd.params {
         case ftree.SketchParams:
-            cmd_mut.feature_id = ftree.feature_tree_add_sketch(cmd.tree_ref, params.sketch_ref, params.name)
-            cmd_mut.feature_index = len(cmd.tree_ref.features) - 1
+            cmd.feature_id = ftree.feature_tree_add_sketch(cmd.tree_ref, params.sketch_ref, params.name)
+            cmd.feature_index = len(cmd.tree_ref.features) - 1
             return true
         }
 
@@ -58,8 +56,8 @@ add_feature_command_execute :: proc(cmd: AddFeatureCommand) -> bool {
             extrude_count := ftree.feature_tree_count_type(cmd.tree_ref, .Extrude)
             name := fmt.aprintf("Extrude%03d", extrude_count + 1)
 
-            cmd_mut.feature_id = ftree.feature_tree_add_extrude(cmd.tree_ref, params.sketch_feature_id, params.depth, params.direction, name)
-            cmd_mut.feature_index = len(cmd.tree_ref.features) - 1
+            cmd.feature_id = ftree.feature_tree_add_extrude(cmd.tree_ref, params.sketch_feature_id, params.depth, params.direction, name)
+            cmd.feature_index = len(cmd.tree_ref.features) - 1
             return true
         }
 
@@ -70,8 +68,8 @@ add_feature_command_execute :: proc(cmd: AddFeatureCommand) -> bool {
             cut_count := ftree.feature_tree_count_type(cmd.tree_ref, .Cut)
             name := fmt.aprintf("Cut%03d", cut_count + 1)
 
-            cmd_mut.feature_id = ftree.feature_tree_add_cut(cmd.tree_ref, params.sketch_feature_id, params.base_feature_id, params.depth, params.direction, name)
-            cmd_mut.feature_index = len(cmd.tree_ref.features) - 1
+            cmd.feature_id = ftree.feature_tree_add_cut(cmd.tree_ref, params.sketch_feature_id, params.base_feature_id, params.depth, params.direction, name)
+            cmd.feature_index = len(cmd.tree_ref.features) - 1
             return true
         }
 
@@ -82,8 +80,8 @@ add_feature_command_execute :: proc(cmd: AddFeatureCommand) -> bool {
             revolve_count := ftree.feature_tree_count_type(cmd.tree_ref, .Revolve)
             name := fmt.aprintf("Revolve%03d", revolve_count + 1)
 
-            cmd_mut.feature_id = ftree.feature_tree_add_revolve(cmd.tree_ref, params.sketch_feature_id, params.angle, params.segments, params.axis_type, name)
-            cmd_mut.feature_index = len(cmd.tree_ref.features) - 1
+            cmd.feature_id = ftree.feature_tree_add_revolve(cmd.tree_ref, params.sketch_feature_id, params.angle, params.segments, params.axis_type, name)
+            cmd.feature_index = len(cmd.tree_ref.features) - 1
             return true
         }
 
@@ -120,7 +118,8 @@ add_feature_command_undo :: proc(cmd: AddFeatureCommand) -> bool {
 
 add_feature_command_redo :: proc(cmd: AddFeatureCommand) -> bool {
     // Re-execute the command
-    return add_feature_command_execute(cmd)
+    cmd_mut := cmd
+    return add_feature_command_execute(&cmd_mut)
 }
 
 add_feature_command_destroy :: proc(cmd: AddFeatureCommand) {
@@ -149,13 +148,11 @@ add_feature_command_get_name :: proc(cmd: AddFeatureCommand) -> string {
 // DeleteFeatureCommand Operations
 // =============================================================================
 
-delete_feature_command_execute :: proc(cmd: DeleteFeatureCommand) -> bool {
+delete_feature_command_execute :: proc(cmd: ^DeleteFeatureCommand) -> bool {
     // Store the feature before deleting
     if cmd.feature_index >= 0 && cmd.feature_index < len(cmd.tree_ref.features) {
-        cmd_mut := cmd
-
         // Copy the feature (shallow copy - we'll need to handle resources carefully)
-        cmd_mut.deleted_feature = cmd.tree_ref.features[cmd.feature_index]
+        cmd.deleted_feature = cmd.tree_ref.features[cmd.feature_index]
 
         // NOTE: We don't call feature_node_destroy here because we want to keep the data
         // for potential redo. The feature data will be freed when the command is destroyed.

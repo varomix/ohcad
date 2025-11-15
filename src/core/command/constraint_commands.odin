@@ -27,9 +27,7 @@ DeleteConstraintCommand :: struct {
 // AddConstraintCommand Operations
 // =============================================================================
 
-add_constraint_command_execute :: proc(cmd: AddConstraintCommand) -> bool {
-    cmd_mut := cmd
-
+add_constraint_command_execute :: proc(cmd: ^AddConstraintCommand) -> bool {
     // Create a new constraint with the provided data
     new_constraint := sketch.Constraint{
         id = cmd.sketch_ref.next_constraint_id,
@@ -39,11 +37,11 @@ add_constraint_command_execute :: proc(cmd: AddConstraintCommand) -> bool {
     }
 
     cmd.sketch_ref.next_constraint_id += 1
-    cmd_mut.constraint_id = new_constraint.id
+    cmd.constraint_id = new_constraint.id
 
     // Add the constraint
     append(&cmd.sketch_ref.constraints, new_constraint)
-    cmd_mut.constraint_index = len(cmd.sketch_ref.constraints) - 1
+    cmd.constraint_index = len(cmd.sketch_ref.constraints) - 1
 
     return true
 }
@@ -111,11 +109,10 @@ add_constraint_command_get_name :: proc(cmd: AddConstraintCommand) -> string {
 // DeleteConstraintCommand Operations
 // =============================================================================
 
-delete_constraint_command_execute :: proc(cmd: DeleteConstraintCommand) -> bool {
+delete_constraint_command_execute :: proc(cmd: ^DeleteConstraintCommand) -> bool {
     // Store the constraint before deleting
     if cmd.constraint_index >= 0 && cmd.constraint_index < len(cmd.sketch_ref.constraints) {
-        cmd_mut := cmd
-        cmd_mut.deleted_constraint = cmd.sketch_ref.constraints[cmd.constraint_index]
+        cmd.deleted_constraint = cmd.sketch_ref.constraints[cmd.constraint_index]
 
         // Delete the constraint
         ordered_remove(&cmd.sketch_ref.constraints, cmd.constraint_index)

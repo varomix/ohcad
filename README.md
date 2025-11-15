@@ -4,19 +4,26 @@ A focused Part-Design style CAD kernel and 2D technical drawing system implement
 
 ## Project Status
 
-🎉 **Week 11.8 Complete - Undo/Redo System!** 🎉
+🎉 **Week 12.2 Complete - Constraint Editing with Inline Text Widget!** 🎉
 
-Working parametric CAD with full undo/redo, hover feedback, closed shape visualization, and professional UI!
+Full parametric CAD workflow with editable constraints and live solver updates!
 
 **Current Features:**
 - ✅ 2D parametric sketching (lines, circles, arcs)
 - ✅ Constraint solver (12 constraint types with visual feedback)
-- ✅ 3D extrusion with parametric updates
+- ✅ **Constraint editing** - Double-click dimensions to edit values inline
+- ✅ 3D extrusion and revolution with parametric updates
+- ✅ **Boolean operations** (cut/pocket with ManifoldCAD)
+- ✅ Face selection and sketch-on-face workflow
 - ✅ SDL3 GPU rendering (Metal on macOS)
 - ✅ Multi-touch gestures (trackpad support)
 - ✅ Feature tree with dependency tracking
+- ✅ Undo/redo system (50 command history)
 - ✅ Professional UI with toolbar, properties panel, feature tree, and status bar
 - ✅ Text rendering with fontstash (BigShoulders font)
+- ✅ Shaded rendering with Phong lighting
+- ✅ STL export for 3D printing
+- ✅ Hover highlights and closed shape visualization
 
 See [Development Plan](docs/development_plan_weekly.md) for complete roadmap and [SDL3 GPU Migration Summary](docs/sdl3_gpu_migration_summary.md) for technical details.
 

@@ -74,21 +74,26 @@ DistanceData :: struct {
 DistanceXData :: struct {
     point1_id: int,
     point2_id: int,
-    distance: f64,  // Signed distance (can be negative)
+    distance: f64,  // Horizontal distance (X-axis)
+    offset: m.Vec2,  // Offset position for dimension line placement (where user clicked)
+    locked_dy: f64,  // Locked Y-difference to maintain angle (p2.y - p1.y)
 }
 
 // DistanceY: Vertical distance between two points
 DistanceYData :: struct {
     point1_id: int,
     point2_id: int,
-    distance: f64,  // Signed distance (can be negative)
+    distance: f64,  // Vertical distance (Y-axis)
+    offset: m.Vec2,  // Offset position for dimension line placement (where user clicked)
+    locked_dx: f64,  // Locked X-difference to maintain angle (p2.x - p1.x)
 }
 
 // Angle: Angle between two lines
 AngleData :: struct {
-    line1_id: int,  // Entity ID of first line
-    line2_id: int,  // Entity ID of second line
-    angle: f64,     // Angle in radians
+    line1_id: int,    // Entity ID of first line
+    line2_id: int,    // Entity ID of second line
+    angle: f64,       // Angle in degrees (0-360)
+    offset: m.Vec2,   // Offset position for arc placement (where user clicked to position dimension)
 }
 
 // Perpendicular: Two lines must be perpendicular
@@ -149,7 +154,8 @@ Constraint :: struct {
     id: int,
     type: ConstraintType,
     data: ConstraintData,
-    enabled: bool,  // Can temporarily disable constraints
+    enabled: bool,   // Can temporarily disable constraints
+    driving: bool,   // True = constrains geometry (driving), False = just displays value (reference/driven)
 }
 
 // Constraint error value - how much a constraint is violated
@@ -187,6 +193,7 @@ sketch_add_constraint :: proc(sketch: ^Sketch2D, type: ConstraintType, data: Con
         type = type,
         data = data,
         enabled = true,
+        driving = true,  // 🔧 FIX: Default to driving dimension (like SolidWorks/OnShape)
     }
 
     append(&sketch.constraints, constraint)
@@ -227,6 +234,85 @@ sketch_set_constraint_enabled :: proc(sketch: ^Sketch2D, constraint_id: int, ena
 
     c.enabled = enabled
     return true
+}
+
+// Select constraint by ID
+sketch_select_constraint :: proc(sketch: ^Sketch2D, constraint_id: int) {
+    sketch.selected_constraint_id = constraint_id
+}
+
+// Deselect constraint
+sketch_deselect_constraint :: proc(sketch: ^Sketch2D) {
+    sketch.selected_constraint_id = -1
+}
+
+// Check if a constraint is selected
+sketch_is_constraint_selected :: proc(sketch: ^Sketch2D, constraint_id: int) -> bool {
+    return sketch.selected_constraint_id == constraint_id
+}
+
+// Modify constraint value (for numeric constraints like distance, angle)
+sketch_modify_constraint_value :: proc(sketch: ^Sketch2D, constraint_id: int, new_value: f64) -> bool {
+    c := sketch_get_constraint(sketch, constraint_id)
+    if c == nil do return false
+
+    // Modify value based on constraint type
+    #partial switch c.type {
+    case .Distance:
+        if data, ok := &c.data.(DistanceData); ok {
+            if new_value <= 0 do return false  // Distance must be positive
+            data.distance = new_value
+            return true
+        }
+    case .DistanceX:
+        if data, ok := &c.data.(DistanceXData); ok {
+            data.distance = new_value  // Can be negative for X
+            return true
+        }
+    case .DistanceY:
+        if data, ok := &c.data.(DistanceYData); ok {
+            data.distance = new_value  // Can be negative for Y
+            return true
+        }
+    case .Angle:
+        if data, ok := &c.data.(AngleData); ok {
+            // Clamp to 0-360 degrees (store in degrees, not radians)
+            clamped := math.mod(new_value, 360.0)
+            if clamped < 0 do clamped += 360.0
+            data.angle = clamped  // Store in degrees
+            return true
+        }
+    }
+
+    return false
+}
+
+// Get constraint value (for numeric constraints)
+sketch_get_constraint_value :: proc(sketch: ^Sketch2D, constraint_id: int) -> (value: f64, ok: bool) {
+    c := sketch_get_constraint(sketch, constraint_id)
+    if c == nil do return 0, false
+
+    #partial switch c.type {
+    case .Distance:
+        if data, is_ok := c.data.(DistanceData); is_ok {
+            return data.distance, true
+        }
+    case .DistanceX:
+        if data, is_ok := c.data.(DistanceXData); is_ok {
+            return data.distance, true
+        }
+    case .DistanceY:
+        if data, is_ok := c.data.(DistanceYData); is_ok {
+            return data.distance, true
+        }
+    case .Angle:
+        if data, is_ok := c.data.(AngleData); is_ok {
+            // Return angle in degrees (already stored in degrees)
+            return data.angle, true
+        }
+    }
+
+    return 0, false
 }
 
 // =============================================================================
@@ -281,7 +367,7 @@ constraint_equation_count :: proc(type: ConstraintType) -> int {
         return 1  // One equation: |p1 - p2| = d
 
     case .DistanceX, .DistanceY:
-        return 1  // One equation: (p1.x - p2.x) = d or (p1.y - p2.y) = d
+        return 2  // Two equations: one for distance, one for maintaining angle
 
     case .Angle:
         return 1  // One equation: angle(v1, v2) = theta
@@ -333,6 +419,7 @@ sketch_evaluate_constraints :: proc(sketch: ^Sketch2D) -> []f64 {
 
     for c in sketch.constraints {
         if !c.enabled do continue
+        if !c.driving do continue  // Skip non-driving constraints (reference dimensions)
 
         // Evaluate each constraint type
         switch data in c.data {
@@ -408,26 +495,34 @@ residuals_distance :: proc(sketch: ^Sketch2D, data: DistanceData, residuals: ^[d
     append(residuals, dist - data.distance)
 }
 
-// DistanceX constraint residuals: horizontal distance = d
+// DistanceX constraint residuals: horizontal distance = d, maintain angle
 residuals_distance_x :: proc(sketch: ^Sketch2D, data: DistanceXData, residuals: ^[dynamic]f64) {
     p1 := sketch_get_point(sketch, data.point1_id)
     p2 := sketch_get_point(sketch, data.point2_id)
 
     if p1 == nil || p2 == nil do return
 
-    // One equation: (p2.x - p1.x) - d = 0
+    // Two equations to maintain angle while controlling X-distance:
+    // 1. (p2.x - p1.x) - d = 0  [controls horizontal distance]
     append(residuals, (p2.x - p1.x) - data.distance)
+
+    // 2. (p2.y - p1.y) - locked_dy = 0  [maintains angle by locking Y-difference]
+    append(residuals, (p2.y - p1.y) - data.locked_dy)
 }
 
-// DistanceY constraint residuals: vertical distance = d
+// DistanceY constraint residuals: vertical distance = d, maintain angle
 residuals_distance_y :: proc(sketch: ^Sketch2D, data: DistanceYData, residuals: ^[dynamic]f64) {
     p1 := sketch_get_point(sketch, data.point1_id)
     p2 := sketch_get_point(sketch, data.point2_id)
 
     if p1 == nil || p2 == nil do return
 
-    // One equation: (p2.y - p1.y) - d = 0
+    // Two equations to maintain angle while controlling Y-distance:
+    // 1. (p2.y - p1.y) - d = 0  [controls vertical distance]
     append(residuals, (p2.y - p1.y) - data.distance)
+
+    // 2. (p2.x - p1.x) - locked_dx = 0  [maintains angle by locking X-difference]
+    append(residuals, (p2.x - p1.x) - data.locked_dx)
 }
 
 // Horizontal constraint residuals: line must be horizontal
@@ -568,8 +663,11 @@ residuals_angle :: proc(sketch: ^Sketch2D, data: AngleData, residuals: ^[dynamic
     cross := v1x*v2y - v1y*v2x
     current_angle := math.atan2(cross, dot)
 
+    // Convert target angle from degrees to radians (data.angle is stored in degrees)
+    target_angle_rad := data.angle * math.PI / 180.0
+
     // One equation: current_angle - target_angle = 0
-    append(residuals, current_angle - data.angle)
+    append(residuals, current_angle - target_angle_rad)
 }
 
 // Equal constraint residuals: equal length (lines) or equal radius (circles)

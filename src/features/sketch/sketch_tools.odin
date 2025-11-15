@@ -2,6 +2,7 @@
 package ohcad_sketch
 
 import "core:fmt"
+import "core:math"
 import m "../../core/math"
 import glfw "vendor:glfw"
 import glsl "core:math/linalg/glsl"
@@ -11,6 +12,16 @@ sketch_set_tool :: proc(sketch: ^Sketch2D, tool: SketchTool) {
     sketch.current_tool = tool
     sketch.temp_point_valid = false
     sketch.first_point_id = -1
+    sketch.second_point_id = -1
+
+    // Reset angular dimension state (used by unified Dimension tool)
+    sketch.first_line_id = -1
+    sketch.second_line_id = -1
+    sketch.angular_offset = m.Vec2{0, 0}
+
+    // Clear all selection state when switching tools
+    sketch.selected_entity = -1
+    sketch.selected_constraint_id = -1
 }
 
 // Update temporary cursor position in sketch coordinates
@@ -59,6 +70,16 @@ handle_line_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
         } else {
             sketch.first_point_id = sketch_add_point(sketch, click_pos.x, click_pos.y)
             sketch.chain_start_point_id = sketch.first_point_id  // Remember the original start point
+
+            // 🔧 FIX: Auto-fix the FIRST point ever created in the sketch (like SolidWorks/OnShape)
+            // This anchors the sketch in space so the solver has a reference point
+            if len(sketch.points) == 1 && len(sketch.constraints) == 0 {
+                sketch_add_constraint(sketch, .FixedPoint, FixedPointData{
+                    point_id = sketch.first_point_id,
+                })
+                fmt.println("🔒 Auto-fixed first point (origin anchor)")
+            }
+
             fmt.printf("Line tool: Start point created at (%.3f, %.3f)\n", click_pos.x, click_pos.y)
         }
     } else {
@@ -169,6 +190,50 @@ sketch_find_nearest_point :: proc(sketch: ^Sketch2D, pos: m.Vec2, threshold: f64
     }
 
     return nearest_id, nearest_id != -1
+}
+
+// Find nearest line entity to given position (for edge selection)
+sketch_find_nearest_line :: proc(sketch: ^Sketch2D, pos: m.Vec2, threshold: f64 = 0.15) -> (entity_id: int, start_pt_id: int, end_pt_id: int, found: bool) {
+    min_dist := threshold
+    nearest_entity := -1
+    nearest_start := -1
+    nearest_end := -1
+
+    for entity, idx in sketch.entities {
+        #partial switch e in entity {
+        case SketchLine:
+            start_pt := sketch_get_point(sketch, e.start_id)
+            end_pt := sketch_get_point(sketch, e.end_id)
+
+            if start_pt != nil && end_pt != nil {
+                start_2d := m.Vec2{start_pt.x, start_pt.y}
+                end_2d := m.Vec2{end_pt.x, end_pt.y}
+
+                if point_near_line(pos, start_2d, end_2d, threshold) {
+                    // Calculate actual distance to line
+                    line_vec := end_2d - start_2d
+                    line_len := glsl.length(line_vec)
+
+                    if line_len > 0.0001 {
+                        point_vec := pos - start_2d
+                        t := glsl.dot(point_vec, line_vec) / (line_len * line_len)
+                        t = glsl.clamp(t, 0.0, 1.0)
+                        closest := start_2d + line_vec * t
+                        dist := glsl.length(pos - closest)
+
+                        if dist < min_dist {
+                            min_dist = dist
+                            nearest_entity = idx
+                            nearest_start = e.start_id
+                            nearest_end = e.end_id
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return nearest_entity, nearest_start, nearest_end, nearest_entity != -1
 }
 
 // Snap position to grid
@@ -345,45 +410,214 @@ sketch_delete_point :: proc(sketch: ^Sketch2D, point_id: int) {
 // Dimension Tool
 // =============================================================================
 
-// Handle dimension tool clicks (3-click workflow: point1, point2, placement)
+// Handle dimension tool clicks - SMART UNIFIED TOOL
+// Supports:
+// - Distance: Click point → point → placement
+// - Distance from edge: Click edge → placement
+// - Angular: Click line → line → placement
+// - Diameter: Click circle → placement (TODO)
 handle_dimension_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
     // Snap threshold - if clicking within 0.2 units of existing point, snap to it
     SNAP_THRESHOLD :: 0.2
+    EDGE_SELECT_THRESHOLD :: 0.15
 
-    if sketch.first_point_id == -1 {
-        // CLICK 1: Select first point
-        snapped_id, found := sketch_find_nearest_point(sketch, click_pos, SNAP_THRESHOLD)
+    // DEBUG: Print current state
+    fmt.printf("🐛 DEBUG: first_point_id=%d, second_point_id=%d, first_line_id=%d, second_line_id=%d\n",
+        sketch.first_point_id, sketch.second_point_id, sketch.first_line_id, sketch.second_line_id)
 
-        if found {
+    // ==========================================================================
+    // CLICK 1: Select first point OR first edge/line
+    // ==========================================================================
+    if sketch.first_point_id == -1 && sketch.first_line_id == -1 {
+        // Try point selection first (points have priority)
+        snapped_id, point_found := sketch_find_nearest_point(sketch, click_pos, SNAP_THRESHOLD)
+
+        if point_found {
+            // DISTANCE DIMENSION MODE: Point selected
             sketch.first_point_id = snapped_id
             pt := sketch_get_point(sketch, snapped_id)
             fmt.printf("Dimension: Point 1 selected (ID=%d) at (%.3f, %.3f)\n", snapped_id, pt.x, pt.y)
-            fmt.println("  → Click second point")
-        } else {
-            fmt.println("❌ No point found - click near an existing point")
-        }
-    } else if sketch.second_point_id == -1 {
-        // CLICK 2: Select second point
-        snapped_id, found := sketch_find_nearest_point(sketch, click_pos, SNAP_THRESHOLD)
-
-        if !found {
-            fmt.println("❌ No point found - click near an existing point")
+            fmt.println("  → Click second point or edge")
             return
         }
 
-        if snapped_id == sketch.first_point_id {
-            fmt.println("❌ Cannot dimension between the same point")
-            sketch.first_point_id = -1
+        // No point found, try to find a nearby LINE/EDGE
+        entity_id, start_pt, end_pt, line_found := sketch_find_nearest_line(sketch, click_pos, EDGE_SELECT_THRESHOLD)
+
+        if line_found {
+            entity := sketch.entities[entity_id]
+            if _, is_line := entity.(SketchLine); is_line {
+                // EDGE SELECTED (ambiguous - could be distance OR angular)
+                // Store BOTH the edge endpoints AND the line ID
+                sketch.first_point_id = start_pt
+                sketch.second_point_id = end_pt
+                sketch.first_line_id = entity_id  // Also track the line for potential angular mode
+
+                pt1 := sketch_get_point(sketch, start_pt)
+                pt2 := sketch_get_point(sketch, end_pt)
+
+                fmt.printf("Dimension: Edge selected (Entity ID=%d)\n", entity_id)
+                fmt.printf("  → Points: %d at (%.3f, %.3f) to %d at (%.3f, %.3f)\n",
+                    start_pt, pt1.x, pt1.y, end_pt, pt2.x, pt2.y)
+                fmt.println("  → Click to place dimension OR click second edge for angular")
+                return
+            }
+        }
+
+        // Nothing found
+        fmt.println("❌ No point or edge found - click near an existing point or edge")
+        return
+    }
+
+    // ==========================================================================
+    // CLICK 2a: ANGULAR MODE - Detect second edge/line selection
+    // ==========================================================================
+    // If we have first_line_id set AND first/second_point_id set (from edge selection),
+    // check if user is clicking another edge to switch to angular mode
+    if sketch.first_line_id >= 0 && sketch.second_line_id == -1 &&
+       sketch.first_point_id >= 0 && sketch.second_point_id >= 0 {
+
+        // Try to find another line
+        entity_id, _, _, line_found := sketch_find_nearest_line(sketch, click_pos, EDGE_SELECT_THRESHOLD)
+
+        if line_found {
+            entity := sketch.entities[entity_id]
+            if _, is_line := entity.(SketchLine); is_line {
+                if entity_id == sketch.first_line_id {
+                    // Clicked same line - treat as placement for distance dimension
+                    // Fall through to distance placement logic
+                } else {
+                    // SWITCH TO ANGULAR MODE: Second line selected
+                    sketch.second_line_id = entity_id
+                    // Clear point IDs since we're now in angular mode
+                    sketch.first_point_id = -1
+                    sketch.second_point_id = -1
+                    fmt.printf("Dimension (Angular): Second line selected (Entity ID=%d)\n", entity_id)
+                    fmt.println("  → Click to position angular dimension arc")
+                    return
+                }
+            }
+        }
+
+        // If we didn't find a second line, treat click as placement position for distance dimension
+        // Fall through to distance placement logic below
+    }
+
+    // ==========================================================================
+    // CLICK 2b: ANGULAR MODE - Select second line (pure angular path)
+    // ==========================================================================
+    if sketch.first_line_id >= 0 && sketch.second_line_id == -1 &&
+       sketch.first_point_id == -1 && sketch.second_point_id == -1 {
+        // This path is unlikely now, but keep for safety
+        // Try to find another line
+        entity_id, _, _, line_found := sketch_find_nearest_line(sketch, click_pos, EDGE_SELECT_THRESHOLD)
+
+        if line_found {
+            entity := sketch.entities[entity_id]
+            if _, is_line := entity.(SketchLine); is_line {
+                if entity_id == sketch.first_line_id {
+                    fmt.println("❌ Cannot measure angle of the same line - select a different line")
+                    return
+                }
+
+                sketch.second_line_id = entity_id
+                fmt.printf("Dimension (Angular): Second line selected (Entity ID=%d)\n", entity_id)
+                fmt.println("  → Click to position angular dimension arc")
+                return
+            }
+        }
+
+        // No line found
+        fmt.println("❌ No line found - click on a line")
+        return
+    }
+
+    // ==========================================================================
+    // CLICK 2b: DISTANCE MODE - Select second point
+    // ==========================================================================
+    if sketch.first_point_id >= 0 && sketch.second_point_id == -1 {
+        // Try POINT selection first (points have priority)
+        snapped_id, point_found := sketch_find_nearest_point(sketch, click_pos, SNAP_THRESHOLD)
+
+        if point_found {
+            if snapped_id == sketch.first_point_id {
+                fmt.println("❌ Cannot dimension between the same point")
+                sketch.first_point_id = -1
+                return
+            }
+
+            sketch.second_point_id = snapped_id
+            pt := sketch_get_point(sketch, snapped_id)
+            fmt.printf("Dimension (Distance): Point 2 selected (ID=%d) at (%.3f, %.3f)\n", snapped_id, pt.x, pt.y)
+            fmt.println("  → Click to place dimension line")
             return
         }
 
-        sketch.second_point_id = snapped_id
-        pt := sketch_get_point(sketch, snapped_id)
-        fmt.printf("Dimension: Point 2 selected (ID=%d) at (%.3f, %.3f)\n", snapped_id, pt.x, pt.y)
-        fmt.println("  → Click to place dimension line (anywhere to confirm)")
-    } else {
-        // CLICK 3: Place dimension at offset position
+        // No point found, try edge selection
+        entity_id, start_pt, end_pt, edge_found := sketch_find_nearest_line(sketch, click_pos, EDGE_SELECT_THRESHOLD)
 
+        if edge_found {
+            // Choose endpoint based on which one is NOT the first point
+            if start_pt != sketch.first_point_id {
+                sketch.second_point_id = start_pt
+            } else if end_pt != sketch.first_point_id {
+                sketch.second_point_id = end_pt
+            } else {
+                fmt.println("❌ Cannot dimension from a point to an edge containing that point")
+                sketch.first_point_id = -1
+                return
+            }
+
+            pt := sketch_get_point(sketch, sketch.second_point_id)
+            fmt.printf("Dimension (Distance): Edge endpoint selected (ID=%d) at (%.3f, %.3f)\n",
+                sketch.second_point_id, pt.x, pt.y)
+            fmt.println("  → Click to place dimension line")
+            return
+        }
+
+        // Nothing found
+        fmt.println("❌ No point or edge found - click near an existing point or edge")
+        return
+    }
+
+    // ==========================================================================
+    // CLICK 3a: ANGULAR MODE - Position arc
+    // ==========================================================================
+    if sketch.first_line_id >= 0 && sketch.second_line_id >= 0 {
+        sketch.angular_offset = click_pos
+
+        // Get both line entities
+        line1 := sketch.entities[sketch.first_line_id].(SketchLine)
+        line2 := sketch.entities[sketch.second_line_id].(SketchLine)
+
+        // Calculate angle between lines
+        angle := calculate_angle_between_lines(sketch, line1, line2)
+
+        // Add angular constraint
+        constraint_id := sketch_add_constraint(sketch, .Angle, AngleData{
+            line1_id = sketch.first_line_id,
+            line2_id = sketch.second_line_id,
+            angle = angle,
+            offset = sketch.angular_offset,
+        })
+
+        fmt.printf("✅ Angular dimension created: %.1f° between lines %d and %d\n",
+            angle, sketch.first_line_id, sketch.second_line_id)
+        fmt.printf("   Placed at offset (%.3f, %.3f)\n", click_pos.x, click_pos.y)
+        fmt.printf("   Constraint ID: %d\n", constraint_id)
+
+        // Reset for next dimension (stay in Dimension tool)
+        sketch.first_line_id = -1
+        sketch.second_line_id = -1
+        sketch.angular_offset = m.Vec2{0, 0}
+        fmt.println("  → Ready for next dimension (or press ESC to finish)")
+        return
+    }
+
+    // ==========================================================================
+    // CLICK 3b: DISTANCE MODE - Place dimension (SMART: horizontal/vertical/diagonal)
+    // ==========================================================================
+    if sketch.first_point_id >= 0 && sketch.second_point_id >= 0 {
         // Get both points
         pt1 := sketch_get_point(sketch, sketch.first_point_id)
         pt2 := sketch_get_point(sketch, sketch.second_point_id)
@@ -395,27 +629,237 @@ handle_dimension_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
             return
         }
 
-        // Calculate distance between points
         p1 := m.Vec2{pt1.x, pt1.y}
         p2 := m.Vec2{pt2.x, pt2.y}
-        distance := glsl.length(p2 - p1)
 
-        // Add distance constraint with current distance value AND offset position
-        constraint_id := sketch_add_constraint(sketch, .Distance, DistanceData{
-            point1_id = sketch.first_point_id,
-            point2_id = sketch.second_point_id,
-            distance = distance,
-            offset = click_pos,  // Store where user clicked for placement
-        })
+        // Calculate vector from point 1 to point 2
+        edge_vec := p2 - p1
+        edge_midpoint := (p1 + p2) * 0.5
 
-        fmt.printf("✅ Dimension created: %.3f units between points %d and %d\n",
-            distance, sketch.first_point_id, sketch.second_point_id)
+        // Calculate vector from midpoint to cursor
+        cursor_vec := click_pos - edge_midpoint
+
+        dimension_type: ConstraintType
+        dimension_value: f64
+        dimension_name: string
+
+        // CASE 1: Edge dimension (selected edge directly with first_line_id set)
+        // → Always use Distance (parallel to edge), don't snap to H/V
+        if sketch.first_line_id >= 0 {
+            // Edge dimension - always use diagonal distance (parallel to edge)
+            dimension_type = .Distance
+            dimension_value = glsl.length(p2 - p1)
+            dimension_name = "Distance"
+            fmt.println("📏 Edge dimension mode (parallel to edge)")
+        } else {
+            // CASE 2: Point-to-point dimension
+            // → Smart detection based on cursor position
+            abs_cursor_x := glsl.abs(cursor_vec.x)
+            abs_cursor_y := glsl.abs(cursor_vec.y)
+
+            // Thresholds for determining dimension type
+            HORIZONTAL_THRESHOLD :: 0.3
+            VERTICAL_THRESHOLD :: 0.3
+
+            // Determine dimension type based on cursor position
+            // CAD LOGIC:
+            // - Cursor offset UP/DOWN (Y direction) → Horizontal dimension (measures X distance)
+            // - Cursor offset LEFT/RIGHT (X direction) → Vertical dimension (measures Y distance)
+            // - Otherwise → Diagonal distance dimension
+            if abs_cursor_y > abs_cursor_x * (1.0 + HORIZONTAL_THRESHOLD) {
+                // Cursor is predominantly vertical offset → Horizontal dimension (DistanceX)
+                dimension_type = .DistanceX
+                dimension_value = p2.x - p1.x  // SIGNED distance (can be negative)
+                dimension_name = "Horizontal"
+            } else if abs_cursor_x > abs_cursor_y * (1.0 + VERTICAL_THRESHOLD) {
+                // Cursor is predominantly horizontal offset → Vertical dimension (DistanceY)
+                dimension_type = .DistanceY
+                dimension_value = p2.y - p1.y  // SIGNED distance (can be negative)
+                dimension_name = "Vertical"
+            } else {
+                // Cursor is diagonal → Diagonal distance dimension
+                dimension_type = .Distance
+                dimension_value = glsl.length(p2 - p1)
+                dimension_name = "Distance"
+            }
+        }
+
+        // Create the appropriate constraint
+        constraint_id: int
+        #partial switch dimension_type {
+        case .DistanceX:
+            // Calculate locked Y-difference to maintain angle
+            locked_dy := p2.y - p1.y
+            constraint_id = sketch_add_constraint(sketch, .DistanceX, DistanceXData{
+                point1_id = sketch.first_point_id,
+                point2_id = sketch.second_point_id,
+                distance = dimension_value,
+                offset = click_pos,
+                locked_dy = locked_dy,
+            })
+
+        case .DistanceY:
+            // Calculate locked X-difference to maintain angle
+            locked_dx := p2.x - p1.x
+            constraint_id = sketch_add_constraint(sketch, .DistanceY, DistanceYData{
+                point1_id = sketch.first_point_id,
+                point2_id = sketch.second_point_id,
+                distance = dimension_value,
+                offset = click_pos,
+                locked_dx = locked_dx,
+            })
+
+        case .Distance:
+            constraint_id = sketch_add_constraint(sketch, .Distance, DistanceData{
+                point1_id = sketch.first_point_id,
+                point2_id = sketch.second_point_id,
+                distance = dimension_value,
+                offset = click_pos,
+            })
+        }
+
+        fmt.printf("✅ %s dimension created: %.3f units between points %d and %d\n",
+            dimension_name, dimension_value, sketch.first_point_id, sketch.second_point_id)
         fmt.printf("   Placed at offset (%.3f, %.3f)\n", click_pos.x, click_pos.y)
         fmt.printf("   Constraint ID: %d\n", constraint_id)
 
         // Reset for next dimension (stay in Dimension tool)
         sketch.first_point_id = -1
         sketch.second_point_id = -1
+        sketch.first_line_id = -1  // IMPORTANT: Also reset line ID to avoid angular mode confusion
         fmt.println("  → Ready for next dimension (or press ESC to finish)")
+        return
     }
+}
+
+// =============================================================================
+// Angular Dimension Helper
+// =============================================================================
+
+// Calculate angle between two lines (in degrees, 0-360)
+calculate_angle_between_lines :: proc(sketch: ^Sketch2D, line1: SketchLine, line2: SketchLine) -> f64 {
+    // Get endpoints of both lines
+    p1_start := sketch_get_point(sketch, line1.start_id)
+    p1_end := sketch_get_point(sketch, line1.end_id)
+    p2_start := sketch_get_point(sketch, line2.start_id)
+    p2_end := sketch_get_point(sketch, line2.end_id)
+
+    if p1_start == nil || p1_end == nil || p2_start == nil || p2_end == nil {
+        return 0
+    }
+
+    // Direction vectors
+    v1 := m.Vec2{p1_end.x - p1_start.x, p1_end.y - p1_start.y}
+    v2 := m.Vec2{p2_end.x - p2_start.x, p2_end.y - p2_start.y}
+
+    // Normalize vectors
+    len1 := glsl.length(v1)
+    len2 := glsl.length(v2)
+
+    if len1 < 0.0001 || len2 < 0.0001 {
+        return 0  // Degenerate line
+    }
+
+    v1 = v1 / len1
+    v2 = v2 / len2
+
+    // Calculate angle using atan2 for full 360° range
+    dot := v1.x * v2.x + v1.y * v2.y
+    cross := v1.x * v2.y - v1.y * v2.x
+    angle_rad := math.atan2(cross, dot)
+
+    // Convert to degrees (0-360 range)
+    angle_deg := angle_rad * 180.0 / math.PI
+    if angle_deg < 0 {
+        angle_deg += 360.0
+    }
+
+    // For typical usage, we want the acute or obtuse angle, not reflex
+    // If angle > 180, return the complement
+    if angle_deg > 180.0 {
+        angle_deg = 360.0 - angle_deg
+    }
+
+    return angle_deg
+}
+
+// =============================================================================
+// Dimension Dragging
+// =============================================================================
+
+// Start dragging a dimension (call when mouse button pressed on dimension)
+sketch_start_drag_dimension :: proc(sketch: ^Sketch2D, constraint_id: int, start_pos: m.Vec2) {
+    constraint := sketch_get_constraint(sketch, constraint_id)
+    if constraint == nil do return
+
+    // Store which constraint we're dragging
+    sketch.dragging_constraint_id = constraint_id
+    sketch.drag_start_pos = start_pos
+
+    // Store the original offset
+    #partial switch data in constraint.data {
+    case DistanceData:
+        sketch.drag_offset_start = data.offset
+    case DistanceXData:
+        sketch.drag_offset_start = data.offset
+    case DistanceYData:
+        sketch.drag_offset_start = data.offset
+    case AngleData:
+        sketch.drag_offset_start = data.offset
+    case:
+        // Other constraints don't support dragging
+        sketch.dragging_constraint_id = -1
+        return
+    }
+
+    fmt.printf("🖱️  Started dragging constraint #%d\n", constraint_id)
+}
+
+// Update dimension position during drag (call on mouse move while dragging)
+sketch_update_drag_dimension :: proc(sketch: ^Sketch2D, current_pos: m.Vec2) {
+    if sketch.dragging_constraint_id < 0 do return
+
+    constraint := sketch_get_constraint(sketch, sketch.dragging_constraint_id)
+    if constraint == nil {
+        sketch.dragging_constraint_id = -1
+        return
+    }
+
+    // Calculate delta from drag start
+    delta := current_pos - sketch.drag_start_pos
+
+    // Update offset based on constraint type
+    #partial switch &data in constraint.data {
+    case DistanceData:
+        // Update offset to new position
+        data.offset = sketch.drag_offset_start + delta
+
+    case DistanceXData:
+        // Update offset to new position
+        data.offset = sketch.drag_offset_start + delta
+
+    case DistanceYData:
+        // Update offset to new position
+        data.offset = sketch.drag_offset_start + delta
+
+    case AngleData:
+        // Update offset to new position
+        data.offset = sketch.drag_offset_start + delta
+    }
+}
+
+// Stop dragging dimension (call on mouse button release)
+sketch_stop_drag_dimension :: proc(sketch: ^Sketch2D) {
+    if sketch.dragging_constraint_id >= 0 {
+        fmt.printf("✓ Dimension #%d repositioned\n", sketch.dragging_constraint_id)
+    }
+
+    sketch.dragging_constraint_id = -1
+    sketch.drag_start_pos = m.Vec2{0, 0}
+    sketch.drag_offset_start = m.Vec2{0, 0}
+}
+
+// Check if currently dragging a dimension
+sketch_is_dragging_dimension :: proc(sketch: ^Sketch2D) -> bool {
+    return sketch.dragging_constraint_id >= 0
 }

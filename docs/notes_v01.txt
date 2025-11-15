@@ -28,3 +28,8 @@ MISC notes
 - ✅ constraint icons
 - update viewport while scaling window
 - runtime optimization, is using a lot of cpu and gpu, what could it be
+
+select nodes on the tree and enter edit mode
+example, sketches, extrude. etc.
+
+not solving when placing / editing dimensions
