@@ -30,6 +30,12 @@ DEFAULT_VIEWER_CONFIG :: ViewerConfig{
     msaa_samples = 4,
 }
 
+// Camera projection mode
+ProjectionMode :: enum {
+    Perspective,
+    Orthographic,
+}
+
 // Camera for 3D navigation
 Camera :: struct {
     position: m.Vec3,
@@ -42,10 +48,14 @@ Camera :: struct {
     elevation: f32, // Vertical rotation (radians)
 
     // Projection
+    projection_mode: ProjectionMode,
     fov: f32,
     near_plane: f32,
     far_plane: f32,
     aspect_ratio: f32,
+
+    // Orthographic projection
+    ortho_width: f32,  // Width of orthographic view in world units
 }
 
 // Viewer state
@@ -144,16 +154,18 @@ camera_init :: proc(camera: ^Camera, aspect_ratio: f32) {
     camera.target = m.Vec3{0, 0, 0}
     camera.up = m.Vec3{0, 1, 0}
 
-    // Default orbit parameters
-    camera.distance = 10.0
+    // Default orbit parameters (adjusted for millimeter-scale CAD)
+    camera.distance = 100.0  // Position camera further back for mm-scale parts
     camera.azimuth = math.PI * 0.25  // 45 degrees
     camera.elevation = math.PI * 0.25 // 45 degrees
 
     // Projection parameters
+    camera.projection_mode = .Perspective  // Start in perspective mode
     camera.fov = 45.0
     camera.near_plane = 0.1
     camera.far_plane = 1000.0
     camera.aspect_ratio = aspect_ratio
+    camera.ortho_width = 100.0  // Width for orthographic projection (mm)
 
     // Update camera position from orbit parameters
     camera_update_position(camera)
@@ -180,12 +192,26 @@ camera_get_view_matrix :: proc(camera: ^Camera) -> glsl.mat4 {
 
 // Get projection matrix for camera
 camera_get_projection_matrix :: proc(camera: ^Camera) -> glsl.mat4 {
-    return glsl.mat4Perspective(
-        math.to_radians(camera.fov),
-        camera.aspect_ratio,
-        camera.near_plane,
-        camera.far_plane,
-    )
+    switch camera.projection_mode {
+    case .Perspective:
+        return glsl.mat4Perspective(
+            math.to_radians(camera.fov),
+            camera.aspect_ratio,
+            camera.near_plane,
+            camera.far_plane,
+        )
+    case .Orthographic:
+        ortho_height := camera.ortho_width / camera.aspect_ratio
+        return glsl.mat4Ortho3d(
+            -camera.ortho_width / 2,   // left
+            camera.ortho_width / 2,    // right
+            -ortho_height / 2,         // bottom
+            ortho_height / 2,          // top
+            camera.near_plane,
+            camera.far_plane,
+        )
+    }
+    return glsl.mat4(1)  // Identity fallback
 }
 
 // Main viewer loop - returns true while viewer should continue running

@@ -28,6 +28,14 @@ CADUIState :: struct {
     temp_revolve_angle: f32,
     temp_cut_depth: f32,
     temp_constraint_value: f32,  // For constraint editing
+
+    // Solid toolbar state
+    show_plane_selector: bool,  // For New Sketch button plane selection
+
+    // Selected face info (for sketch-on-face workflow)
+    selected_feature_id: int,  // -1 if no face selected
+    selected_face_index: int,  // Face index within feature
+    create_sketch_on_face: bool,  // Flag to signal main loop to create sketch on selected face
 }
 
 cad_ui_state_init :: proc() -> CADUIState {
@@ -41,6 +49,8 @@ cad_ui_state_init :: proc() -> CADUIState {
         temp_extrude_depth = 1.0,
         temp_revolve_angle = 360.0,
         temp_cut_depth = 0.3,
+        selected_feature_id = -1,  // No face selected initially
+        selected_face_index = -1,
     }
 }
 
@@ -121,6 +131,156 @@ ui_toolbar_panel :: proc(
     // Calculate total height used
     total_rows := (len(tools) + icons_per_row - 1) / icons_per_row
     current_y += f32(total_rows) * (icon_size + icon_spacing) + spacing
+
+    return current_y - y  // Return total height used
+}
+
+// =============================================================================
+// Solid Toolbar Panel - Tool Selection for Solid Mode
+// =============================================================================
+
+ui_solid_toolbar_panel :: proc(
+    ctx: ^UIContext,
+    cad_state: ^CADUIState,
+    x, y, width: f32,
+) -> f32 {
+    if !cad_state.show_toolbar do return 0
+
+    current_y := y
+    spacing: f32 = 10
+
+    // Section: SOLID TOOLS
+    ui_section_box(
+        ctx,
+        x, current_y,
+        width, 40,
+        "SOLID TOOLS",
+        {100, 150, 255, 255},  // Blue
+        {100, 150, 255, 255},
+    )
+    current_y += 50
+
+    // Tool Icons - 4 across (same layout as sketch toolbar)
+    icon_size: f32 = 56
+    icon_spacing: f32 = 4
+    icons_per_row := 4
+    icon_x_start := x + spacing
+
+    // Main solid mode tools
+    tools := []struct{
+        name: string,
+        abbrev: string,
+        id: int,  // 1=NewSketch, 2=Extrude, 3=Fillet, 4=Chamfer, 5=Box, 6=Cylinder, 7=Sphere, 8=Cone, 9=Torus
+        color: [4]u8,
+        enabled: bool,
+    }{
+        {"New Sketch", "NS", 1, {0, 200, 220, 255}, true},      // Cyan
+        {"Extrude", "EX", 2, {0, 200, 100, 255}, true},         // Green
+        {"Fillet", "FT", 3, {150, 150, 150, 255}, false},       // Gray (disabled)
+        {"Chamfer", "CH", 4, {150, 150, 150, 255}, false},      // Gray (disabled)
+        {"Box", "BX", 5, {255, 180, 50, 255}, true},            // Orange - PRIMITIVE
+        {"Cylinder", "CY", 6, {255, 120, 180, 255}, true},      // Pink - PRIMITIVE
+        {"Sphere", "SP", 7, {120, 200, 255, 255}, true},        // Light Blue - PRIMITIVE
+        {"Cone", "CN", 8, {200, 150, 255, 255}, true},          // Purple - PRIMITIVE
+        {"Torus", "TR", 9, {255, 220, 100, 255}, true},         // Yellow - PRIMITIVE
+    }
+
+    row := 0
+    col := 0
+
+    for tool in tools {
+        icon_x := icon_x_start + f32(col) * (icon_size + icon_spacing)
+        icon_y := current_y + f32(row) * (icon_size + icon_spacing)
+
+        // Check if this is New Sketch and plane selector is active
+        is_selected := (tool.id == 1 && cad_state.show_plane_selector)
+
+        if ui_tool_icon(
+            ctx,
+            icon_x, icon_y,
+            icon_size,
+            tool.abbrev,
+            tool.color,
+            is_selected,
+        ) {
+            if tool.enabled {
+                if tool.id == 1 {
+                    // New Sketch - check if face is selected first
+                    if cad_state.selected_feature_id >= 0 {
+                        // Face is selected → create sketch on that face
+                        cad_state.create_sketch_on_face = true
+                        fmt.println("New Sketch on selected face")
+                    } else {
+                        // No face selected → show plane selector
+                        cad_state.show_plane_selector = !cad_state.show_plane_selector
+                        fmt.printf("New Sketch clicked - plane selector: %v\n", cad_state.show_plane_selector)
+                    }
+                } else if tool.id == 2 {
+                    fmt.printf("Extrude clicked (TODO: implement handler)\n")
+                } else if tool.id >= 5 && tool.id <= 9 {
+                    // Primitives: Box, Cylinder, Sphere, Cone, Torus
+                    ctx.clicked_primitive_id = tool.id
+                    fmt.printf("Primitive clicked: %s (ID: %d)\n", tool.name, tool.id)
+                } else {
+                    fmt.printf("Tool: %s\n", tool.name)
+                }
+            } else {
+                fmt.printf("Tool: %s (not yet implemented)\n", tool.name)
+            }
+        }
+
+        col += 1
+        if col >= icons_per_row {
+            col = 0
+            row += 1
+        }
+    }
+
+    // Calculate total height used by icons
+    total_rows := (len(tools) + icons_per_row - 1) / icons_per_row
+    current_y += f32(total_rows) * (icon_size + icon_spacing) + spacing
+
+    // Plane selection buttons (show when New Sketch is active)
+    if cad_state.show_plane_selector {
+        // Small indented plane selector icons (3 in a row)
+        plane_icon_size: f32 = 52
+        plane_icon_spacing: f32 = 4
+        plane_x_start := x + spacing * 2  // Indent slightly
+
+        planes := []struct{
+            name: string,
+            abbrev: string,
+            plane_id: int,
+            color: [4]u8,
+        }{
+            {"XY", "XY", 1, {0, 200, 100, 255}},      // Green
+            {"YZ", "YZ", 2, {200, 150, 0, 255}},      // Orange
+            {"ZX", "ZX", 3, {150, 100, 255, 255}},    // Purple
+        }
+
+        plane_col := 0
+        for plane in planes {
+            plane_icon_x := plane_x_start + f32(plane_col) * (plane_icon_size + plane_icon_spacing)
+
+            if ui_tool_icon(
+                ctx,
+                plane_icon_x, current_y,
+                plane_icon_size,
+                plane.abbrev,
+                plane.color,
+                false,
+            ) {
+                // Store selected plane in UI context
+                ctx.selected_sketch_plane = plane.plane_id
+                cad_state.show_plane_selector = false  // Close selector after selection
+                fmt.printf("Selected plane: %s (ID: %d)\n", plane.name, plane.plane_id)
+            }
+
+            plane_col += 1
+        }
+
+        current_y += plane_icon_size + spacing
+    }
 
     return current_y - y  // Return total height used
 }
@@ -355,6 +515,25 @@ ui_properties_panel :: proc(
                 doc.document_settings_set_units(document_settings, .Millimeters)
             }
             needs_update = true
+        }
+        current_y += widget_height + spacing
+
+        // Show units on dimensions toggle
+        show_units_text := document_settings.show_units_on_dimensions ? "SHOW UNITS: ON" : "SHOW UNITS: OFF"
+        show_units_color := document_settings.show_units_on_dimensions ? [4]u8{0, 150, 0, 255} : [4]u8{100, 100, 100, 255}
+
+        if ui_button(
+            ctx,
+            x + spacing, current_y,
+            width - spacing * 2, widget_height,
+            show_units_text,
+            show_units_color,
+            {0, 200, 0, 255},
+        ) {
+            // Toggle show units on dimensions
+            document_settings.show_units_on_dimensions = !document_settings.show_units_on_dimensions
+            needs_update = true
+            fmt.printf("✓ Show units on dimensions: %v\n", document_settings.show_units_on_dimensions)
         }
         current_y += widget_height + spacing * 2  // Extra spacing before feature properties
 
@@ -788,6 +967,7 @@ ui_cad_status_bar :: proc(
     is_sketch_mode: bool,
     sk: ^sketch.Sketch2D,
     editing_constraint_id: int,  // NEW: Pass editing state
+    document_settings: ^doc.DocumentSettings,  // NEW: Pass document settings for unit display
     screen_width: u32,
     screen_height: u32,
 ) {
@@ -867,6 +1047,15 @@ ui_cad_status_bar :: proc(
     }
 
     ui_render_text(ctx, status_text, status_x, status_y, ctx.style.font_size_small, ctx.style.text_secondary)
+
+    // Display current unit system on the right side of status bar
+    if document_settings != nil {
+        unit_text := fmt.tprintf("Units: %s", doc.unit_name(document_settings.units))
+        unit_text_width, _ := ui_measure_text(ctx, unit_text, ctx.style.font_size_small)
+        unit_x := f32(screen_width) - unit_text_width - 16
+        unit_y := status_y
+        ui_render_text(ctx, unit_text, unit_x, unit_y, ctx.style.font_size_small, {150, 150, 150, 255})  // Gray text
+    }
 }
 
 // =============================================================================
@@ -894,14 +1083,26 @@ ui_cad_layout :: proc(
     panel_x := f32(screen_width) - cad_state.toolbar_width - 20
     panel_y: f32 = 20  // Standard top margin
 
-    // Draw toolbar
-    toolbar_height := ui_toolbar_panel(
-        ctx,
-        cad_state,
-        sk,
-        panel_x, panel_y,
-        cad_state.toolbar_width,
-    )
+    // Draw appropriate toolbar based on mode
+    toolbar_height: f32
+    if is_sketch_mode && sk != nil {
+        // SKETCH MODE: Show sketch tools (Select, Line, Circle, etc.)
+        toolbar_height = ui_toolbar_panel(
+            ctx,
+            cad_state,
+            sk,
+            panel_x, panel_y,
+            cad_state.toolbar_width,
+        )
+    } else {
+        // SOLID MODE: Show solid tools (New Sketch, Extrude, etc.)
+        toolbar_height = ui_solid_toolbar_panel(
+            ctx,
+            cad_state,
+            panel_x, panel_y,
+            cad_state.toolbar_width,
+        )
+    }
 
     // Draw properties panel below toolbar
     properties_y := panel_y + toolbar_height + 20
@@ -939,7 +1140,7 @@ ui_cad_layout :: proc(
     ctx.checkmark_clicked = tree_interaction.double_clicked
 
     // Draw status bar at bottom
-    ui_cad_status_bar(ctx, is_sketch_mode, sk, editing_constraint_id, screen_width, screen_height)
+    ui_cad_status_bar(ctx, is_sketch_mode, sk, editing_constraint_id, document_settings, screen_width, screen_height)
 
     return needs_update
 }

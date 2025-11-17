@@ -27,12 +27,14 @@ HoverState :: struct {
     distance: f64,        // Distance from cursor to entity (for debugging)
 }
 
-// Hit testing tolerance (in sketch units)
-HOVER_TOLERANCE_POINT :: 0.15    // Distance to detect point hover
-HOVER_TOLERANCE_EDGE :: 0.10     // Distance to detect edge hover
+// Hit testing tolerance (in screen pixels)
+// These are multiplied by pixel_size_world to get world-space distance
+HOVER_TOLERANCE_POINT_PIXELS :: 10.0    // Pixels for point hover detection
+HOVER_TOLERANCE_EDGE_PIXELS :: 8.0      // Pixels for edge hover detection
+HOVER_TOLERANCE_CONSTRAINT_PIXELS :: 15.0  // Pixels for constraint hover detection
 
 // Detect hover for point under cursor
-detect_hover_point :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolerance: f64 = HOVER_TOLERANCE_POINT) -> (int, f64) {
+detect_hover_point :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolerance: f64) -> (int, f64) {
     closest_id := -1
     closest_dist := tolerance
 
@@ -50,7 +52,7 @@ detect_hover_point :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolerance: f64
 }
 
 // Detect hover for line edge under cursor
-detect_hover_line :: proc(sketch: ^Sketch2D, line: SketchLine, cursor_pos: m.Vec2, tolerance: f64 = HOVER_TOLERANCE_EDGE) -> (bool, f64) {
+detect_hover_line :: proc(sketch: ^Sketch2D, line: SketchLine, cursor_pos: m.Vec2, tolerance: f64) -> (bool, f64) {
     start_pt := sketch_get_point(sketch, line.start_id)
     end_pt := sketch_get_point(sketch, line.end_id)
 
@@ -68,7 +70,7 @@ detect_hover_line :: proc(sketch: ^Sketch2D, line: SketchLine, cursor_pos: m.Vec
 }
 
 // Detect hover for circle edge under cursor
-detect_hover_circle :: proc(sketch: ^Sketch2D, circle: SketchCircle, cursor_pos: m.Vec2, tolerance: f64 = HOVER_TOLERANCE_EDGE) -> (bool, f64) {
+detect_hover_circle :: proc(sketch: ^Sketch2D, circle: SketchCircle, cursor_pos: m.Vec2, tolerance: f64) -> (bool, f64) {
     center_pt := sketch_get_point(sketch, circle.center_id)
     if center_pt == nil {
         return false, 0.0
@@ -84,7 +86,7 @@ detect_hover_circle :: proc(sketch: ^Sketch2D, circle: SketchCircle, cursor_pos:
 }
 
 // Detect hover for arc edge under cursor
-detect_hover_arc :: proc(sketch: ^Sketch2D, arc: SketchArc, cursor_pos: m.Vec2, tolerance: f64 = HOVER_TOLERANCE_EDGE) -> (bool, f64) {
+detect_hover_arc :: proc(sketch: ^Sketch2D, arc: SketchArc, cursor_pos: m.Vec2, tolerance: f64) -> (bool, f64) {
     center_pt := sketch_get_point(sketch, arc.center_id)
     start_pt := sketch_get_point(sketch, arc.start_id)
     end_pt := sketch_get_point(sketch, arc.end_id)
@@ -138,13 +140,19 @@ detect_hover_arc :: proc(sketch: ^Sketch2D, arc: SketchArc, cursor_pos: m.Vec2, 
 }
 
 // Detect hover for constraint (dimension/icon) under cursor
-detect_hover_constraint :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolerance: f64 = 0.25) -> (int, f64) {
+detect_hover_constraint :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolerance: f64, pixel_size_world: f64) -> (int, f64) {
     if sketch.constraints == nil || len(sketch.constraints) == 0 {
         return -1, 0.0
     }
 
     closest_id := -1
     closest_dist := tolerance
+
+    // SCREEN-SPACE ICON SIZE: Match the rendering (24 pixels icon, 40 pixels offset)
+    icon_size_pixels := 24.0
+    offset_pixels := 40.0
+    icon_size_world := pixel_size_world * icon_size_pixels
+    offset_world := pixel_size_world * offset_pixels
 
     for constraint in sketch.constraints {
         if !constraint.enabled do continue
@@ -277,9 +285,19 @@ detect_hover_constraint :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolerance
 
             mid_2d := m.Vec2{(p1.x + p2.x) * 0.5, (p1.y + p2.y) * 0.5}
 
-            // Icon is positioned above the line (matches rendering)
-            ICON_SIZE :: 0.15
-            icon_center := m.Vec2{mid_2d.x, mid_2d.y + ICON_SIZE * 1.5}
+            // Calculate line direction in sketch space
+            line_dir := m.Vec2{p2.x - p1.x, p2.y - p1.y}
+            line_len := glsl.length(line_dir)
+
+            // Offset perpendicular to the line (same logic as rendering)
+            perpendicular := m.Vec2{0, 1}
+            if line_len > 0.001 {
+                line_dir = line_dir / line_len
+                // Perpendicular vector (rotate 90° CCW): (x,y) → (-y,x)
+                perpendicular = m.Vec2{-line_dir.y, line_dir.x}
+            }
+
+            icon_center := mid_2d + perpendicular * offset_world
 
             // Check distance to icon center (circular hit area)
             dist := glsl.length(cursor_pos - icon_center)
@@ -304,12 +322,59 @@ detect_hover_constraint :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolerance
 
             mid_2d := m.Vec2{(p1.x + p2.x) * 0.5, (p1.y + p2.y) * 0.5}
 
-            // Icon is positioned to the right of the line (matches rendering)
-            ICON_SIZE :: 0.15
-            icon_center := m.Vec2{mid_2d.x + ICON_SIZE * 1.5, mid_2d.y}
+            // Calculate line direction in sketch space
+            line_dir := m.Vec2{p2.x - p1.x, p2.y - p1.y}
+            line_len := glsl.length(line_dir)
+
+            // Offset perpendicular to the line (same logic as rendering)
+            perpendicular := m.Vec2{1, 0}
+            if line_len > 0.001 {
+                line_dir = line_dir / line_len
+                // Perpendicular vector (rotate 90° CCW): (x,y) → (-y,x)
+                perpendicular = m.Vec2{-line_dir.y, line_dir.x}
+            }
+
+            icon_center := mid_2d + perpendicular * offset_world
 
             // Check distance to icon center (circular hit area)
             dist := glsl.length(cursor_pos - icon_center)
+
+            if dist < closest_dist {
+                closest_dist = dist
+                closest_id = constraint.id
+            }
+
+        case DiameterData:
+            // Check distance to diameter dimension line
+            if data.circle_id < 0 || data.circle_id >= len(sketch.entities) do continue
+
+            entity := sketch.entities[data.circle_id]
+            circle, ok := entity.(SketchCircle)
+            if !ok do continue
+
+            center_pt := sketch_get_point(sketch, circle.center_id)
+            if center_pt == nil do continue
+
+            center_2d := m.Vec2{center_pt.x, center_pt.y}
+
+            // Calculate diameter line direction from center to offset position
+            offset_vec := data.offset - center_2d
+            offset_len := glsl.length(offset_vec)
+
+            // Default to horizontal if offset is at center
+            dim_dir: m.Vec2
+            if offset_len < 1e-10 {
+                dim_dir = m.Vec2{1, 0}
+            } else {
+                dim_dir = offset_vec / offset_len
+            }
+
+            // Calculate two points on circle edge along diameter line
+            edge1_2d := center_2d - dim_dir * circle.radius
+            edge2_2d := center_2d + dim_dir * circle.radius
+
+            // Check distance to dimension line
+            dist := distance_point_to_line_segment(cursor_pos, edge1_2d, edge2_2d)
 
             if dist < closest_dist {
                 closest_dist = dist
@@ -328,7 +393,7 @@ detect_hover_constraint :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolerance
 
 // Detect hover for circle radius handle (Week 12.3 - Task 2)
 // Returns (entity_index, is_hovered, distance)
-detect_hover_radius_handle :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolerance: f64 = HOVER_TOLERANCE_POINT) -> (int, bool, f64) {
+detect_hover_radius_handle :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolerance: f64) -> (int, bool, f64) {
     closest_id := -1
     closest_dist := tolerance
     found := false
@@ -342,6 +407,21 @@ detect_hover_radius_handle :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolera
     circle, ok := entity.(SketchCircle)
     if !ok {
         return -1, false, 0.0
+    }
+
+    // Check if circle has a diameter constraint - if so, don't show radius handle
+    // (dimension takes precedence over manual scaling)
+    if sketch.constraints != nil {
+        for constraint in sketch.constraints {
+            if constraint.enabled {
+                if diameter_data, is_diameter := constraint.data.(DiameterData); is_diameter {
+                    if diameter_data.circle_id == sketch.selected_entity {
+                        // This circle has a diameter constraint - don't allow radius handle hover
+                        return -1, false, 0.0
+                    }
+                }
+            }
+        }
     }
 
     // Calculate radius handle position (on the right side of circle)
@@ -367,7 +447,7 @@ detect_hover_radius_handle :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolera
 
 // Detect hover for line endpoint handles (Week 12.3 - Task 3)
 // Returns (entity_index, point_id, is_hovered, distance)
-detect_hover_line_endpoint_handle :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolerance: f64 = HOVER_TOLERANCE_POINT) -> (int, int, bool, f64) {
+detect_hover_line_endpoint_handle :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, tolerance: f64) -> (int, int, bool, f64) {
     // Only check selected lines (handles only visible on selected lines)
     if sketch.selected_entity < 0 || sketch.selected_entity >= len(sketch.entities) {
         return -1, -1, false, 0.0
@@ -406,7 +486,8 @@ detect_hover_line_endpoint_handle :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2,
 }
 
 // Update hover state based on cursor position
-sketch_update_hover :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2) -> HoverState {
+// pixel_size_world: size of one screen pixel in world units (for zoom-independent tolerances)
+sketch_update_hover :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2, pixel_size_world: f64 = 0.01) -> HoverState {
     hover := HoverState{
         entity_type = .None,
         entity_id = -1,
@@ -415,9 +496,14 @@ sketch_update_hover :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2) -> HoverState
         distance = 0.0,
     }
 
+    // Calculate screen-space constant tolerances
+    point_tolerance := pixel_size_world * HOVER_TOLERANCE_POINT_PIXELS
+    edge_tolerance := pixel_size_world * HOVER_TOLERANCE_EDGE_PIXELS
+    constraint_tolerance := pixel_size_world * HOVER_TOLERANCE_CONSTRAINT_PIXELS
+
     // First check for line endpoint handles (Week 12.3 - Task 3)
     // This has highest priority when a line is selected
-    line_entity_id, endpoint_point_id, is_endpoint_hovered, endpoint_dist := detect_hover_line_endpoint_handle(sketch, cursor_pos)
+    line_entity_id, endpoint_point_id, is_endpoint_hovered, endpoint_dist := detect_hover_line_endpoint_handle(sketch, cursor_pos, point_tolerance)
     if is_endpoint_hovered {
         hover.entity_type = .LineEndpointHandle
         hover.entity_id = line_entity_id // Line entity index
@@ -428,7 +514,7 @@ sketch_update_hover :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2) -> HoverState
 
     // Then check for radius handle hover (Week 12.3 - Task 2)
     // This has high priority when a circle is selected
-    radius_handle_id, is_handle_hovered, handle_dist := detect_hover_radius_handle(sketch, cursor_pos)
+    radius_handle_id, is_handle_hovered, handle_dist := detect_hover_radius_handle(sketch, cursor_pos, point_tolerance)
     if is_handle_hovered {
         hover.entity_type = .RadiusHandle
         hover.entity_id = radius_handle_id // Circle entity index
@@ -437,7 +523,7 @@ sketch_update_hover :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2) -> HoverState
     }
 
     // Then check for point hover (high priority - easier to select)
-    point_id, point_dist := detect_hover_point(sketch, cursor_pos)
+    point_id, point_dist := detect_hover_point(sketch, cursor_pos, point_tolerance)
     if point_id >= 0 {
         hover.entity_type = .Point
         hover.point_id = point_id
@@ -446,14 +532,14 @@ sketch_update_hover :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2) -> HoverState
     }
 
     // Then check for edge hover
-    closest_edge_dist := HOVER_TOLERANCE_EDGE
+    closest_edge_dist := edge_tolerance
     closest_edge_id := -1
     closest_edge_type := HoverEntityType.None
 
     for entity, idx in sketch.entities {
         switch e in entity {
         case SketchLine:
-            is_hover, dist := detect_hover_line(sketch, e, cursor_pos)
+            is_hover, dist := detect_hover_line(sketch, e, cursor_pos, edge_tolerance)
             if is_hover && dist < closest_edge_dist {
                 closest_edge_dist = dist
                 closest_edge_id = idx
@@ -461,7 +547,7 @@ sketch_update_hover :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2) -> HoverState
             }
 
         case SketchCircle:
-            is_hover, dist := detect_hover_circle(sketch, e, cursor_pos)
+            is_hover, dist := detect_hover_circle(sketch, e, cursor_pos, edge_tolerance)
             if is_hover && dist < closest_edge_dist {
                 closest_edge_dist = dist
                 closest_edge_id = idx
@@ -469,7 +555,7 @@ sketch_update_hover :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2) -> HoverState
             }
 
         case SketchArc:
-            is_hover, dist := detect_hover_arc(sketch, e, cursor_pos)
+            is_hover, dist := detect_hover_arc(sketch, e, cursor_pos, edge_tolerance)
             if is_hover && dist < closest_edge_dist {
                 closest_edge_dist = dist
                 closest_edge_id = idx
@@ -479,7 +565,7 @@ sketch_update_hover :: proc(sketch: ^Sketch2D, cursor_pos: m.Vec2) -> HoverState
     }
 
     // Check for constraint hover (dimensions, icons, etc.)
-    constraint_id, constraint_dist := detect_hover_constraint(sketch, cursor_pos)
+    constraint_id, constraint_dist := detect_hover_constraint(sketch, cursor_pos, constraint_tolerance, pixel_size_world)
 
     // Choose the closest between edge and constraint
     // Edges have priority if they're closer

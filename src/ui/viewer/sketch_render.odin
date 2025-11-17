@@ -319,6 +319,10 @@ render_sketch_constraints :: proc(shader: ^LineShader, sk: ^sketch.Sketch2D, mvp
         case sketch.AngleData:
             render_angular_dimension(shader, sk, data, mvp, text_renderer, view, proj, viewport_width, viewport_height)
 
+        case sketch.DiameterData:
+            // Diameter dimensions are only rendered in GPU version (viewer_gpu.odin)
+            // Legacy OpenGL renderer doesn't support diameter dimensions yet
+
         case sketch.TangentData, sketch.PointOnLineData, sketch.PointOnCircleData, sketch.FixedPointData:
             // These constraint types don't have visual indicators yet
             // Will be added in future iterations

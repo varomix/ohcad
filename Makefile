@@ -89,7 +89,7 @@ run-gpu-viewer: gpu-viewer
 gpu:
 	@echo "Building OhCAD (SDL3 GPU)..."
 	@mkdir -p $(BIN_DIR)
-	$(ODIN) build src/main_gpu.odin -file -out:$(BIN_DIR)/ohcad_gpu $(DEBUG_FLAGS) -extra-linker-flags:"-L/opt/homebrew/lib"
+	$(ODIN) build src/main_gpu.odin -file -out:$(BIN_DIR)/ohcad_gpu $(DEBUG_FLAGS) -extra-linker-flags:"-L/opt/homebrew/lib -Llibs -Lsrc/core/geometry/occt -lslvs -rpath @executable_path/../libs -rpath @executable_path/../src/core/geometry/occt -rpath /opt/homebrew/lib"
 	@echo "✓ SDL3 GPU build complete: $(BIN_DIR)/ohcad_gpu"
 
 # Run SDL3 GPU main application

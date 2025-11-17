@@ -15,9 +15,11 @@ import "core:strconv"
 import cut "features/cut"
 import extrude "features/extrude"
 import ftree "features/feature_tree"
+import primitives "features/primitives"
 import revolve "features/revolve"
 import sketch "features/sketch"
 import stl "io/stl"
+import occt "core/geometry/occt"
 import v "ui/viewer"
 import ui "ui/widgets"
 import sdl "vendor:sdl3"
@@ -79,6 +81,7 @@ AppStateGPU :: struct {
 	needs_wireframe_update:     bool,
 	needs_selection_update:     bool,
 	needs_solid_update:         bool,
+	needs_redraw:               bool, // Event-driven rendering: only redraw when true
 
 	// Status message (for status bar feedback)
 	status_message:             string,
@@ -221,6 +224,13 @@ solve_constraints :: proc(app: ^AppStateGPU) {
 main :: proc() {
 	fmt.println("=== OhCAD Interactive Sketcher (SDL3 GPU) ===")
 
+	// Initialize OCCT library
+	fmt.println("🔍 DEBUG: Initializing OCCT library...")
+	occt.initialize()
+	defer occt.cleanup()
+	version := occt.version()
+	fmt.printf("🔍 DEBUG: ✓ OCCT Version: %s\n", version)
+
 	// Initialize SDL3 GPU viewer
 	viewer_inst, ok := v.viewer_gpu_init()
 	if !ok {
@@ -306,6 +316,7 @@ main :: proc() {
 	app.solid_wireframes = make([dynamic]v.WireframeMeshGPU)
 	app.needs_wireframe_update = false
 	app.needs_selection_update = false
+	app.needs_redraw = true // Render first frame
 
 	defer {
 		for &mesh in app.solid_wireframes {
@@ -352,28 +363,38 @@ main :: proc() {
 	fmt.println("  [HOME] Reset camera")
 	fmt.println("  [Q] Quit\n")
 
-	// Main render loop
+	// Main render loop (event-driven rendering for efficiency)
 	for v.viewer_gpu_should_continue(viewer_inst) {
-		// Poll events and handle input
+		// Poll all pending events (non-blocking)
 		handle_events_gpu(app)
 
-		// Update wireframe if needed (use active sketch)
-		active_sketch := get_active_sketch(app)
-		if app.needs_wireframe_update && active_sketch != nil {
-			v.wireframe_mesh_gpu_destroy(&app.wireframe)
-			app.wireframe = v.sketch_to_wireframe_gpu(active_sketch)
-			app.needs_wireframe_update = false
-		}
+		// Only update and render if something changed
+		if app.needs_redraw {
+			// Update wireframe if needed (use active sketch)
+			active_sketch := get_active_sketch(app)
+			if app.needs_wireframe_update && active_sketch != nil {
+				v.wireframe_mesh_gpu_destroy(&app.wireframe)
+				app.wireframe = v.sketch_to_wireframe_gpu(active_sketch)
+				app.needs_wireframe_update = false
+			}
 
-		// Update selection wireframe if needed (use active sketch)
-		if app.needs_selection_update && active_sketch != nil {
-			v.wireframe_mesh_gpu_destroy(&app.wireframe_selected)
-			app.wireframe_selected = v.sketch_to_wireframe_selected_gpu(active_sketch)
-			app.needs_selection_update = false
-		}
+			// Update selection wireframe if needed (use active sketch)
+			if app.needs_selection_update && active_sketch != nil {
+				v.wireframe_mesh_gpu_destroy(&app.wireframe_selected)
+				app.wireframe_selected = v.sketch_to_wireframe_selected_gpu(active_sketch)
+				app.needs_selection_update = false
+			}
 
-		// Render frame
-		render_frame_gpu(app)
+			// Render frame
+			render_frame_gpu(app)
+
+			// Reset redraw flag after rendering
+			app.needs_redraw = false
+		} else {
+			// Nothing to draw - sleep briefly to avoid busy-waiting
+			// This allows event processing while keeping CPU usage minimal
+			sdl.Delay(10) // 10ms sleep = max 100 FPS when needed, ~0% CPU when idle
+		}
 	}
 
 	fmt.println("Viewer closed successfully")
@@ -384,6 +405,9 @@ handle_events_gpu :: proc(app: ^AppStateGPU) {
 	event: sdl.Event
 
 	for sdl.PollEvent(&event) {
+		// Any event should trigger a redraw
+		app.needs_redraw = true
+
 		#partial switch event.type {
 		case .QUIT:
 			app.viewer.should_close = true
@@ -534,7 +558,9 @@ handle_events_gpu :: proc(app: ^AppStateGPU) {
 						}
 					} else {
 						// Update hover state for sketch entities (only when not dragging)
-						app.hover_state = sketch.sketch_update_hover(active_sketch, sketch_pos)
+						// Calculate pixel size in world units for zoom-independent hover tolerances
+						pixel_size := f64(v.get_pixel_size_world(app.viewer))
+						app.hover_state = sketch.sketch_update_hover(active_sketch, sketch_pos, pixel_size)
 					}
 				}
 			}
@@ -605,14 +631,11 @@ handle_events_gpu :: proc(app: ^AppStateGPU) {
 							// Check if there are constraints - if so, run the solver
 							if len(active_sketch.constraints) > 0 {
 								fmt.println("🔄 Re-solving constraints after point move...")
-								result := sketch.sketch_solve_constraints(active_sketch)
-								if result.status == .Success {
+								// 🔧 Use new libslvs solver
+								if sketch.solve_sketch(active_sketch) {
 									fmt.println("✅ Constraints solved!")
 								} else {
-									fmt.println(
-										"⚠️  Constraint solving status:",
-										result.status,
-									)
+									fmt.println("⚠️  Constraint solving failed")
 								}
 							}
 						}
@@ -1153,6 +1176,86 @@ handle_mouse_button_gpu :: proc(app: ^AppStateGPU, button: ^sdl.MouseButtonEvent
 			// Count constraints before click
 			constraint_count_before := len(active_sketch.constraints)
 
+			// USE HOVER STATE FOR SELECTION: If in Select tool and hovering over an entity, select it directly
+			// This ensures selection uses the same screen-space tolerances as hover (no mismatch)
+			if active_sketch.current_tool == .Select {
+				#partial switch app.hover_state.entity_type {
+				case .Point, .Line, .Circle, .Arc:
+					// Hovering over an entity - select it directly using hover state
+					active_sketch.selected_entity = app.hover_state.entity_id
+					active_sketch.selected_constraint_id = -1 // Deselect constraint
+					fmt.printf("✅ Selected entity #%d via hover state\n", app.hover_state.entity_id)
+					app.needs_wireframe_update = true
+					app.needs_selection_update = true
+					return  // Don't call sketch_handle_click
+				case .None:
+					// Not hovering over anything - deselect
+					active_sketch.selected_entity = -1
+					active_sketch.selected_constraint_id = -1
+					fmt.println("Deselected (no hover)")
+					app.needs_wireframe_update = true
+					app.needs_selection_update = true
+					return  // Don't call sketch_handle_click
+				}
+			}
+
+			// For other tools (Line, Circle, Dimension), use normal click handling
+
+			// SPECIAL CASE: Line tool - hover-based snapping for better UX
+			if active_sketch.current_tool == .Line && active_sketch.first_point_id != -1 {
+				// Already drawing a line - check for snapping to existing points
+
+				// Case 1: Hovering over chain start point - auto-close the shape
+				if active_sketch.chain_start_point_id != -1 &&
+				   app.hover_state.entity_type == .Point &&
+				   app.hover_state.point_id == active_sketch.chain_start_point_id {
+					// Hovering over chain start point - close the shape!
+					fmt.println("🔗 Auto-closing shape (hover-based snap to start point)")
+
+					// Close the shape by connecting current endpoint to the original start point
+					sketch.sketch_add_line(active_sketch, active_sketch.first_point_id, active_sketch.chain_start_point_id)
+
+					// Reset line tool state
+					active_sketch.first_point_id = -1
+					active_sketch.chain_start_point_id = -1
+
+					// Auto-exit to Select tool
+					active_sketch.current_tool = .Select
+
+					app.needs_wireframe_update = true
+					app.needs_selection_update = true
+					return
+				}
+
+				// Case 2: Hovering over any other existing point - snap to it
+				if app.hover_state.entity_type == .Point &&
+				   app.hover_state.point_id != active_sketch.first_point_id {
+					// Hovering over a different point - snap to it
+					end_point_id := app.hover_state.point_id
+					fmt.printf("📍 Snapping to existing point #%d (hover-based)\n", end_point_id)
+
+					// Create line to this point
+					sketch.sketch_add_line(active_sketch, active_sketch.first_point_id, end_point_id)
+
+					// Check if this is the chain start point
+					if end_point_id == active_sketch.chain_start_point_id {
+						fmt.println("✅ Shape closed! Auto-exiting line tool → Select tool")
+						active_sketch.first_point_id = -1
+						active_sketch.chain_start_point_id = -1
+						active_sketch.current_tool = .Select
+					} else {
+						fmt.println("✅ Connected to existing point! Auto-exiting line tool → Select tool")
+						active_sketch.first_point_id = -1
+						active_sketch.chain_start_point_id = -1
+						active_sketch.current_tool = .Select
+					}
+
+					app.needs_wireframe_update = true
+					app.needs_selection_update = true
+					return
+				}
+			}
+
 			sketch.sketch_handle_click(active_sketch, sketch_pos)
 			app.needs_wireframe_update = true
 			app.needs_selection_update = true
@@ -1195,23 +1298,54 @@ screen_to_sketch_gpu :: proc(
 	inv_proj := glsl.inverse(projection)
 	inv_view := glsl.inverse(view)
 
-	// Ray in view space
-	ray_clip := glsl.vec4{f32(ndc_x), f32(ndc_y), -1.0, 1.0}
-	ray_eye := inv_proj * ray_clip
-	ray_eye = glsl.vec4{ray_eye.x, ray_eye.y, -1.0, 0.0}
+	ray_origin: m.Vec3
+	ray_direction: m.Vec3
 
-	// Ray in world space
-	ray_world_4 := inv_view * ray_eye
-	ray_world := glsl.vec3{ray_world_4.x, ray_world_4.y, ray_world_4.z}
-	ray_dir := glsl.normalize(ray_world)
+	// Handle orthographic vs perspective projection differently
+	if app.viewer.camera.projection_mode == .Orthographic {
+		// ORTHOGRAPHIC: Rays are parallel to camera forward direction
+		// Ray origin is on the near plane at the mouse position
 
-	// Convert to double precision
-	ray_origin := m.Vec3 {
-		f64(app.viewer.camera.position.x),
-		f64(app.viewer.camera.position.y),
-		f64(app.viewer.camera.position.z),
+		// Unproject point at near plane (z=-1 in NDC)
+		near_point_clip := glsl.vec4{f32(ndc_x), f32(ndc_y), -1.0, 1.0}
+		near_point_eye := inv_proj * near_point_clip
+		near_point_world := inv_view * near_point_eye
+
+		// Ray origin is the unprojected near point
+		ray_origin = m.Vec3{
+			f64(near_point_world.x),
+			f64(near_point_world.y),
+			f64(near_point_world.z),
+		}
+
+		// Ray direction is simply the camera's forward direction (negative Z in view space)
+		camera_forward := glsl.normalize(app.viewer.camera.target - app.viewer.camera.position)
+		ray_direction = m.Vec3{
+			f64(camera_forward.x),
+			f64(camera_forward.y),
+			f64(camera_forward.z),
+		}
+
+	} else {
+		// PERSPECTIVE: Rays originate from camera position and diverge
+		// Ray in view space
+		ray_clip := glsl.vec4{f32(ndc_x), f32(ndc_y), -1.0, 1.0}
+		ray_eye := inv_proj * ray_clip
+		ray_eye = glsl.vec4{ray_eye.x, ray_eye.y, -1.0, 0.0}
+
+		// Ray in world space
+		ray_world_4 := inv_view * ray_eye
+		ray_world := glsl.vec3{ray_world_4.x, ray_world_4.y, ray_world_4.z}
+		ray_dir := glsl.normalize(ray_world)
+
+		// Ray origin is camera position
+		ray_origin = m.Vec3{
+			f64(app.viewer.camera.position.x),
+			f64(app.viewer.camera.position.y),
+			f64(app.viewer.camera.position.z),
+		}
+		ray_direction = m.Vec3{f64(ray_dir.x), f64(ray_dir.y), f64(ray_dir.z)}
 	}
-	ray_direction := m.Vec3{f64(ray_dir.x), f64(ray_dir.y), f64(ray_dir.z)}
 
 	// Intersect ray with sketch plane
 	plane_normal := sk.plane.normal
@@ -1405,6 +1539,11 @@ render_frame_gpu :: proc(app: ^AppStateGPU) {
 			point_color := is_active ? [4]f32{0.0, 0.8, 0.9, 1.0} : [4]f32{0.0, 0.2, 0.3, 0.5}
 			v.viewer_gpu_render_sketch_points(app.viewer, cmd, pass, sk, mvp, point_color, 4.0)
 
+			// Render circle center points with distinct color (yellow-orange) to make them easier to identify
+			if is_active {
+				render_circle_centers_gpu(app, cmd, pass, sk, mvp)
+			}
+
 			// Only render selection, preview, and constraints for ACTIVE sketch
 			if is_active && active_sketch != nil {
 				// Render hovered entity in bright yellow (before selection for proper layering)
@@ -1434,7 +1573,7 @@ render_frame_gpu :: proc(app: ^AppStateGPU) {
 				}
 
 				// Render preview geometry (cursor + temp line/circle)
-				v.viewer_gpu_render_sketch_preview(app.viewer, cmd, pass, active_sketch, mvp)
+				v.viewer_gpu_render_sketch_preview(app.viewer, cmd, pass, &app.text_renderer, active_sketch, mvp, view, proj)
 
 				// Render constraints (dimensions, icons)
 				v.viewer_gpu_render_sketch_constraints(
@@ -1473,7 +1612,7 @@ render_frame_gpu :: proc(app: ^AppStateGPU) {
 			}
 
 		case .Shaded:
-			// Shaded mode: Render lit triangles
+			// Shaded mode: Render lit triangles with wireframe overlay (Fusion 360 style)
 			for feature in app.feature_tree.features {
 				if !feature.visible || !feature.enabled do continue
 				if feature.result_solid == nil do continue
@@ -1482,14 +1621,27 @@ render_frame_gpu :: proc(app: ^AppStateGPU) {
 				tri_mesh := v.solid_to_triangle_mesh_gpu(feature.result_solid)
 				defer v.triangle_mesh_gpu_destroy(&tri_mesh)
 
-				// Render with lighting (light gray material)
+				// Render with lighting (dark gray material like Fusion 360)
 				v.viewer_gpu_render_triangle_mesh(
 					app.viewer,
 					cmd,
 					pass,
 					&tri_mesh,
-					{0.7, 0.7, 0.7, 1.0},
+					{0.45, 0.45, 0.45, 1.0},
 					mvp,
+				)
+			}
+
+			// Render wireframe overlay for clear geometry definition
+			for &solid_mesh in app.solid_wireframes {
+				v.viewer_gpu_render_wireframe(
+					app.viewer,
+					cmd,
+					pass,
+					&solid_mesh,
+					{0.2, 0.2, 0.2, 1},
+					mvp,
+					1.5,
 				)
 			}
 
@@ -1507,7 +1659,7 @@ render_frame_gpu :: proc(app: ^AppStateGPU) {
 					cmd,
 					pass,
 					&tri_mesh,
-					{0.7, 0.7, 0.7, 1.0},
+					{0.45, 0.45, 0.45, 1.0},
 					mvp,
 				)
 			}
@@ -1558,6 +1710,43 @@ render_frame_gpu :: proc(app: ^AppStateGPU) {
 			w,
 			h,
 		)
+
+		// 🔧 Render sketch status (DOF, constraint info)
+		if active_sketch != nil && len(active_sketch.constraints) > 0 {
+			dof := sketch.get_sketch_dof(active_sketch)
+
+			// Determine status color based on DOF
+			status_color: [4]u8
+			status_text: string
+
+			if dof == 0 {
+				// Fully constrained - green
+				status_color = {0, 255, 0, 255}
+				status_text = fmt.tprintf("✓ Fully Constrained (%d constraints)", len(active_sketch.constraints))
+			} else if dof > 0 {
+				// Under-constrained - yellow
+				status_color = {255, 255, 0, 255}
+				status_text = fmt.tprintf("DOF: %d (%d constraints)", dof, len(active_sketch.constraints))
+			} else {
+				// Over-constrained - red
+				status_color = {255, 0, 0, 255}
+				status_text = fmt.tprintf("⚠ Over-Constrained (DOF: %d)", dof)
+			}
+
+			// Render status below title
+			v.text_render_2d_gpu(
+				&app.text_renderer,
+				cmd,
+				pass,
+				status_text,
+				20,
+				70,  // Below title
+				24,  // Smaller font
+				status_color,
+				w,
+				h,
+			)
+		}
 
 		// Render hover tooltip if hovering over an entity
 		if app.hover_state.entity_type != .None && active_sketch != nil {
@@ -1844,6 +2033,90 @@ render_frame_gpu :: proc(app: ^AppStateGPU) {
 							)
 						}
 					}
+
+				case sketch.DiameterData:
+					// Get the circle entity
+					if data.circle_id >= 0 && data.circle_id < len(active_sketch.entities) {
+						entity := active_sketch.entities[data.circle_id]
+						if circle, ok := entity.(sketch.SketchCircle); ok {
+							// Get circle center point
+							center_pt := sketch.sketch_get_point(active_sketch, circle.center_id)
+
+							if center_pt != nil {
+								// Calculate diameter line direction from center to offset position
+								center_2d := m.Vec2{center_pt.x, center_pt.y}
+								offset_vec := data.offset - center_2d
+								offset_len := glsl.length(offset_vec)
+
+								// Default to horizontal if offset is at center
+								dim_dir: m.Vec2
+								if offset_len < 1e-10 {
+									dim_dir = m.Vec2{1, 0}
+								} else {
+									dim_dir = offset_vec / offset_len
+								}
+
+								// Calculate midpoint of diameter line (center of circle)
+								mid_dim_3d := sketch.sketch_to_world(&active_sketch.plane, center_2d)
+
+								// Project to screen space
+								clip_pos :=
+									proj *
+									view *
+									glsl.vec4 {
+											f32(mid_dim_3d.x),
+											f32(mid_dim_3d.y),
+											f32(mid_dim_3d.z),
+											1.0,
+										}
+
+								if clip_pos.w != 0.0 {
+									// Convert from clip space to screen space
+									ndc := clip_pos.xyz / clip_pos.w
+									screen_x := (ndc.x + 1.0) * 0.5 * f32(w)
+									screen_y := (1.0 - ndc.y) * 0.5 * f32(h)
+
+									// Measure text size for widget sizing
+									text_size: f32 = 28
+
+									// Estimate widget size (we need this before rendering)
+									sample_text := "Ø000.00|" // Sample for sizing (includes Ø symbol)
+									text_width, text_height := v.text_measure_gpu(
+										&app.text_renderer,
+										sample_text,
+										text_size,
+									)
+
+									// Add padding around text
+									padding: f32 = 8
+									box_width := text_width + padding * 2
+									box_height := text_height + padding * 2
+
+									// Center the box on the dimension location
+									box_x := screen_x - box_width * 0.5
+									box_y := screen_y - box_height * 0.5
+
+									// Update widget position and size
+									app.text_input_widget.x = box_x
+									app.text_input_widget.y = box_y
+									app.text_input_widget.width = box_width
+									app.text_input_widget.height = box_height
+									app.text_input_widget.text_size = text_size
+
+									// Render widget (handles background, border, text with cursor)
+									ui.text_input_widget_render_3d(
+										&app.text_input_widget,
+										app.viewer,
+										&app.text_renderer,
+										cmd,
+										pass,
+										w,
+										h,
+									)
+								}
+							}
+						}
+					}
 				}
 			}
 		}
@@ -1865,6 +2138,136 @@ render_frame_gpu :: proc(app: ^AppStateGPU) {
 			w,
 			h,
 		)
+
+		// Handle plane selection from Solid Toolbar (New Sketch button)
+		if app.ui_context.selected_sketch_plane > 0 {
+			plane_type: SketchPlaneType
+
+			switch app.ui_context.selected_sketch_plane {
+			case 1:
+				plane_type = .XY
+				fmt.println("📐 Creating sketch on XY plane (from UI toolbar)")
+			case 2:
+				plane_type = .YZ
+				fmt.println("📐 Creating sketch on YZ plane (from UI toolbar)")
+			case 3:
+				plane_type = .ZX
+				fmt.println("📐 Creating sketch on ZX plane (from UI toolbar)")
+			case:
+				fmt.printf("⚠️  Unknown plane ID: %d\n", app.ui_context.selected_sketch_plane)
+			}
+
+			// Create sketch on selected plane
+			if app.ui_context.selected_sketch_plane >= 1 && app.ui_context.selected_sketch_plane <= 3 {
+				create_sketch_on_plane(app, plane_type)
+				app.needs_wireframe_update = true
+			}
+
+			// Reset plane selection for next frame
+			app.ui_context.selected_sketch_plane = 0
+		}
+
+		// Handle sketch-on-face creation from Solid Toolbar (New Sketch button with face selected)
+		if app.cad_ui_state.create_sketch_on_face {
+			create_sketch_on_face(app)
+			app.needs_wireframe_update = true
+			app.cad_ui_state.create_sketch_on_face = false  // Reset flag
+		}
+
+	// Handle primitive button clicks from Solid Toolbar
+	if app.ui_context.clicked_primitive_id >= 5 && app.ui_context.clicked_primitive_id <= 9 {
+		prim_id := app.ui_context.clicked_primitive_id
+
+		// Create primitive with default parameters
+		// TODO: In the future, show parameter dialog to let user customize dimensions
+		result: primitives.PrimitiveResult
+
+		switch prim_id {
+		case 5:  // Box
+			fmt.println("📦 Creating Box primitive (20x30x40mm)")
+			result = primitives.create_primitive(primitives.BoxParams{
+				width = 20.0,
+				height = 30.0,
+				depth = 40.0,
+			})
+
+		case 6:  // Cylinder
+			fmt.println("🛢️  Creating Cylinder primitive (r=10mm, h=50mm)")
+			result = primitives.create_primitive(primitives.CylinderParams{
+				radius = 10.0,
+				height = 50.0,
+			})
+
+		case 7:  // Sphere
+			fmt.println("⚪ Creating Sphere primitive (r=15mm)")
+			result = primitives.create_primitive(primitives.SphereParams{
+				radius = 15.0,
+			})
+
+		case 8:  // Cone
+			fmt.println("🔺 Creating Cone primitive (r1=10mm, r2=5mm, h=30mm)")
+			result = primitives.create_primitive(primitives.ConeParams{
+				bottom_radius = 10.0,
+				top_radius = 5.0,
+				height = 30.0,
+			})
+
+		case 9:  // Torus
+			fmt.println("🍩 Creating Torus primitive (major=20mm, minor=5mm)")
+			result = primitives.create_primitive(primitives.TorusParams{
+				major_radius = 20.0,
+				minor_radius = 5.0,
+			})
+		}
+
+		// Add primitive to feature tree if successful
+		if result.success {
+			// Create feature name
+			primitive_name: string
+			switch prim_id {
+			case 5: primitive_name = "Box"
+			case 6: primitive_name = "Cylinder"
+			case 7: primitive_name = "Sphere"
+			case 8: primitive_name = "Cone"
+			case 9: primitive_name = "Torus"
+			}
+
+			// Manually create feature node for primitive
+			// (Since we don't have a Primitive feature type yet, we use Extrude)
+			feature := ftree.FeatureNode{
+				id = app.feature_tree.next_id,
+				type = ftree.FeatureType.Extrude,  // TEMP: Using Extrude type
+				name = primitive_name,
+				params = ftree.ExtrudeParams{
+					depth = 1.0,  // Dummy value (not used for primitives)
+					direction = extrude.ExtrudeDirection.Forward,
+					sketch_feature_id = -1,  // No sketch for primitives
+				},
+				status = ftree.FeatureStatus.Valid,
+				parent_features = make([dynamic]int),
+				occt_shape = result.occt_shape,  // Store OCCT shape for boolean operations
+				result_solid = result.solid,      // Store tessellated mesh for rendering
+				enabled = true,
+				visible = true,
+			}
+
+			app.feature_tree.next_id += 1
+			append(&app.feature_tree.features, feature)
+			app.feature_tree.active_feature_id = feature.id
+
+			// Update wireframe
+			update_solid_wireframes_gpu(app)
+			app.needs_wireframe_update = true
+
+			fmt.printf("✅ Primitive '%s' added to feature tree (ID: %d)\n", primitive_name, feature.id)
+			fmt.println("💡 TIP: Press [Shift+W] for shaded mode to see the solid primitive")
+		} else {
+			fmt.printf("❌ Failed to create primitive: %s\n", result.message)
+		}
+
+		// Reset primitive click for next frame
+		app.ui_context.clicked_primitive_id = 0
+	}
 
 		// Handle feature tree double-click (Week 12.36 - History Navigation)
 		if app.ui_context.feature_tree_click_id >= 0 {
@@ -1943,6 +2346,11 @@ render_frame_gpu :: proc(app: ^AppStateGPU) {
 
 	// Submit command buffer
 	_ = sdl.SubmitGPUCommandBuffer(cmd)
+
+	// Update font atlas texture AFTER frame rendering
+	// This uploads any new glyphs that were added during this frame
+	// They will be available for the NEXT frame (one-frame delay is acceptable)
+	v.text_renderer_gpu_update_texture(&app.text_renderer)
 }
 
 // Test extrude feature
@@ -2415,18 +2823,95 @@ change_active_feature_parameter :: proc(app: ^AppStateGPU, delta: f64) {
 // Modal System (NEW)
 // =============================================================================
 
+// Align camera to face sketch plane orthogonally and switch to orthographic projection
+align_camera_to_sketch_plane :: proc(camera: ^v.Camera, plane: sketch.SketchPlane) {
+	// Switch to orthographic projection
+	camera.projection_mode = .Orthographic
+
+	// Determine camera orientation based on plane normal
+	normal := plane.normal
+
+	// Set camera to look perpendicular to the sketch plane
+	if math.abs(normal.z - 1.0) < 0.01 {
+		// XY plane (Front view) - normal = (0, 0, 1)
+		// Camera at (0, 0, distance) looking at origin
+		camera.azimuth = math.PI / 2  // 90 degrees (points camera along +Z)
+		camera.elevation = 0.0  // Level
+		camera.up = {0, 1, 0}
+	} else if math.abs(normal.z + 1.0) < 0.01 {
+		// XY plane back view - normal = (0, 0, -1)
+		// Camera at (0, 0, -distance) looking at origin
+		camera.azimuth = -math.PI / 2  // -90 degrees (points camera along -Z)
+		camera.elevation = 0.0
+		camera.up = {0, 1, 0}
+	} else if math.abs(normal.x - 1.0) < 0.01 {
+		// YZ plane (Right view) - normal = (1, 0, 0)
+		// Camera at (distance, 0, 0) looking at origin
+		camera.azimuth = 0.0  // 0 degrees (points camera along +X)
+		camera.elevation = 0.0
+		camera.up = {0, 1, 0}
+	} else if math.abs(normal.x + 1.0) < 0.01 {
+		// YZ plane (Left view) - normal = (-1, 0, 0)
+		// Camera at (-distance, 0, 0) looking at origin
+		camera.azimuth = math.PI  // 180 degrees (points camera along -X)
+		camera.elevation = 0.0
+		camera.up = {0, 1, 0}
+	} else if math.abs(normal.y - 1.0) < 0.01 {
+		// ZX plane (Top view) - normal = (0, 1, 0)
+		camera.azimuth = 0.0
+		camera.elevation = math.PI / 2  // 90 degrees down
+		camera.up = {0, 0, -1}  // Z points down in top view
+	} else if math.abs(normal.y + 1.0) < 0.01 {
+		// ZX plane (Bottom view) - normal = (0, -1, 0)
+		camera.azimuth = 0.0
+		camera.elevation = -math.PI / 2  // -90 degrees
+		camera.up = {0, 0, 1}
+	} else {
+		// Arbitrary plane - calculate orientation from normal
+		// Point camera along the negative normal direction
+		camera.azimuth = f32(math.atan2(normal.x, normal.z))
+		camera.elevation = f32(math.asin(-normal.y))
+		camera.up = {0, 1, 0}  // Default up
+	}
+
+	// Set camera target to plane origin
+	camera.target = plane.origin
+
+	// Set a reasonable distance for orthographic view
+	camera.distance = 100.0
+
+	// Update camera position based on new orientation
+	v.camera_update_position(camera)
+
+	fmt.println("📷 Camera aligned to sketch plane (orthographic)")
+}
+
 // Enter sketch mode (start editing a sketch)
 enter_sketch_mode :: proc(app: ^AppStateGPU, sketch_id: int) {
 	app.mode = .Sketch
 	app.active_sketch_id = sketch_id
-	fmt.printf("=== ENTERED SKETCH MODE (Sketch ID: %d) ===\n", sketch_id)
+	app.editing_feature_id = sketch_id  // NEW: Set editing state so OK button appears
+
+	// Get the sketch to determine its plane
+	sk := get_active_sketch(app)
+	if sk != nil {
+		// Align camera to sketch plane and switch to orthographic
+		align_camera_to_sketch_plane(&app.viewer.camera, sk.plane)
+		fmt.printf("=== ENTERED SKETCH MODE (Sketch ID: %d) - Camera aligned to sketch plane ===\n", sketch_id)
+	} else {
+		fmt.printf("=== ENTERED SKETCH MODE (Sketch ID: %d) ===\n", sketch_id)
+	}
 }
 
 // Exit sketch mode (return to solid mode)
 exit_sketch_mode :: proc(app: ^AppStateGPU) {
+	// Switch camera back to perspective mode
+	app.viewer.camera.projection_mode = .Perspective
+
 	app.mode = .Solid
 	app.active_sketch_id = -1
-	fmt.println("=== EXITED TO SOLID MODE ===")
+	app.editing_feature_id = -1  // NEW: Clear editing state
+	fmt.println("=== EXITED TO SOLID MODE - Camera switched to perspective ===")
 }
 
 // Enter sketch edit mode (Week 12.36 - History Navigation)
@@ -2452,12 +2937,15 @@ enter_sketch_edit_mode :: proc(app: ^AppStateGPU, sketch_feature_id: int) {
 		return
 	}
 
+	// Align camera to sketch plane before entering edit mode
+	align_camera_to_sketch_plane(&app.viewer.camera, params.sketch_ref.plane)
+
 	// Enter sketch mode for this feature
 	app.mode = .Sketch
 	app.active_sketch_id = sketch_feature_id
 	app.editing_feature_id = sketch_feature_id
 
-	fmt.printf("✏️  ENTERED EDIT MODE for %s (ID: %d)\n", feature.name, sketch_feature_id)
+	fmt.printf("✏️  ENTERED EDIT MODE for %s (ID: %d) - Camera aligned\n", feature.name, sketch_feature_id)
 	fmt.println("   Modify geometry/constraints, then press [ESC] to finish editing")
 }
 
@@ -2472,12 +2960,15 @@ exit_sketch_edit_mode :: proc(app: ^AppStateGPU) {
 	feature := ftree.feature_tree_get_feature(&app.feature_tree, edited_feature_id)
 	feature_name := feature != nil ? feature.name : "Unknown"
 
+	// Switch camera back to perspective mode
+	app.viewer.camera.projection_mode = .Perspective
+
 	// Exit to Solid Mode
 	app.mode = .Solid
 	app.active_sketch_id = -1
 	app.editing_feature_id = -1
 
-	fmt.printf("⬅️  EXITED EDIT MODE for %s\n", feature_name)
+	fmt.printf("⬅️  EXITED EDIT MODE for %s - Camera switched to perspective\n", feature_name)
 
 	// Mark the edited feature and all dependents as dirty
 	ftree.feature_tree_mark_dirty(&app.feature_tree, edited_feature_id)
@@ -2849,6 +3340,9 @@ select_face_at_cursor :: proc(app: ^AppStateGPU, screen_x, screen_y: f64) -> boo
 
 	if found_face {
 		app.selected_face = selected
+		// Update CAD UI state for "New Sketch" button
+		app.cad_ui_state.selected_feature_id = selected.feature_id
+		app.cad_ui_state.selected_face_index = selected.face_index
 		fmt.printf(
 			"✅ Selected face: Feature %d, Face %d\n",
 			selected.feature_id,
@@ -2857,6 +3351,9 @@ select_face_at_cursor :: proc(app: ^AppStateGPU, screen_x, screen_y: f64) -> boo
 		return true
 	} else {
 		app.selected_face = nil
+		// Clear CAD UI state
+		app.cad_ui_state.selected_feature_id = -1
+		app.cad_ui_state.selected_face_index = -1
 		fmt.println("❌ No face hit")
 		return false
 	}
@@ -2932,6 +3429,10 @@ start_constraint_editing :: proc(app: ^AppStateGPU, constraint_id: int) {
 	case sketch.AngleData:
 		// Convert angle from stored value to degrees for display
 		current_value = data.angle // Already stored in degrees from creation
+		is_editable = true
+
+	case sketch.DiameterData:
+		current_value = data.diameter
 		is_editable = true
 
 	case:
@@ -3110,6 +3611,30 @@ update_constraint_value :: proc(app: ^AppStateGPU, constraint_id: int, new_value
 			old_value,
 			new_value,
 		)
+
+	case sketch.DiameterData:
+		old_value := data.diameter
+		data.diameter = new_value
+
+		// Update the circle's radius to match new diameter
+		if data.circle_id >= 0 && data.circle_id < len(active_sketch.entities) {
+			if circle, ok := &active_sketch.entities[data.circle_id].(sketch.SketchCircle); ok {
+				circle.radius = new_value / 2.0
+				fmt.printf(
+					"✅ Updated diameter constraint #%d: Ø%.2f → Ø%.2f (radius: %.2f)\n",
+					constraint_id,
+					old_value,
+					new_value,
+					circle.radius,
+				)
+			} else {
+				fmt.println("❌ Failed to update circle - entity is not a circle")
+				return
+			}
+		} else {
+			fmt.println("❌ Failed to update circle - invalid circle ID")
+			return
+		}
 
 	case:
 		fmt.println("❌ Cannot update this constraint type")
@@ -3400,6 +3925,29 @@ render_filled_triangles_gpu :: proc(
 	sdl.BindGPUGraphicsPipeline(pass, app.viewer.pipeline)
 }
 
+// Render circle center points with distinct color to make them easier to identify and select
+render_circle_centers_gpu :: proc(
+	app: ^AppStateGPU,
+	cmd: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+	sk: ^sketch.Sketch2D,
+	mvp: matrix[4, 4]f32,
+) {
+	// Circle center color: yellow-orange to stand out from regular points
+	center_color := [4]f32{1.0, 0.7, 0.2, 1.0}
+
+	// Render each circle's center point with distinct color
+	for entity in sk.entities {
+		if circle, is_circle := entity.(sketch.SketchCircle); is_circle {
+			center_pt := sketch.sketch_get_point(sk, circle.center_id)
+			if center_pt != nil {
+				// Render center point slightly larger (5px) for better visibility
+				v.viewer_gpu_render_single_point(app.viewer, cmd, pass, sk, center_pt, mvp, center_color, 5.0)
+			}
+		}
+	}
+}
+
 // Render radius handle for selected circle (Week 12.3 - Task 2)
 render_radius_handle_gpu :: proc(
 	app: ^AppStateGPU,
@@ -3417,6 +3965,21 @@ render_radius_handle_gpu :: proc(
 	circle, ok := entity.(sketch.SketchCircle)
 	if !ok {
 		return
+	}
+
+	// Check if circle has a diameter constraint - if so, don't show radius handle
+	// (dimension takes precedence over manual scaling)
+	if sk.constraints != nil {
+		for constraint in sk.constraints {
+			if constraint.enabled {
+				if diameter_data, is_diameter := constraint.data.(sketch.DiameterData); is_diameter {
+					if diameter_data.circle_id == sk.selected_entity {
+						// This circle has a diameter constraint - don't show radius handle
+						return
+					}
+				}
+			}
+		}
 	}
 
 	// Get center point

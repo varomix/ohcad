@@ -13,7 +13,7 @@ Full parametric CAD workflow with editable constraints and live solver updates!
 - ✅ Constraint solver (12 constraint types with visual feedback)
 - ✅ **Constraint editing** - Double-click dimensions to edit values inline
 - ✅ 3D extrusion and revolution with parametric updates
-- ✅ **Boolean operations** (cut/pocket with ManifoldCAD)
+- ✅ **Boolean operations** (cut/pocket with OCCT - OpenCascade Technology)
 - ✅ Face selection and sketch-on-face workflow
 - ✅ SDL3 GPU rendering (Metal on macOS)
 - ✅ Multi-touch gestures (trackpad support)

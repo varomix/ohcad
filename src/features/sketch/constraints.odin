@@ -4,6 +4,7 @@ package ohcad_sketch
 import "core:fmt"
 import "core:math"
 import m "../../core/math"
+import glsl "core:math/linalg/glsl"
 
 // Constraint types for parametric sketching
 ConstraintType :: enum {
@@ -14,6 +15,7 @@ ConstraintType :: enum {
     Distance,          // Distance between two points
     DistanceX,         // Horizontal distance between two points
     DistanceY,         // Vertical distance between two points
+    Diameter,          // Diameter of a circle (Week 13 - Circle dimensions)
 
     // Angle constraints
     Angle,             // Angle between two lines
@@ -44,6 +46,7 @@ ConstraintData :: union {
     DistanceData,
     DistanceXData,
     DistanceYData,
+    DiameterData,
     AngleData,
     PerpendicularData,
     ParallelData,
@@ -86,6 +89,13 @@ DistanceYData :: struct {
     distance: f64,  // Vertical distance (Y-axis)
     offset: m.Vec2,  // Offset position for dimension line placement (where user clicked)
     locked_dx: f64,  // Locked X-difference to maintain angle (p2.x - p1.x)
+}
+
+// Diameter: Diameter of a circle
+DiameterData :: struct {
+    circle_id: int,   // Entity ID of the circle
+    diameter: f64,    // Diameter value (2 * radius)
+    offset: m.Vec2,   // Offset position for dimension line placement (where user clicked)
 }
 
 // Angle: Angle between two lines
@@ -183,7 +193,8 @@ DOFStatus :: enum {
 // =============================================================================
 
 // Add constraint to sketch
-sketch_add_constraint :: proc(sketch: ^Sketch2D, type: ConstraintType, data: ConstraintData) -> int {
+// skip_solve: If true, don't run solver immediately (useful for auto-constraints during entity creation)
+sketch_add_constraint :: proc(sketch: ^Sketch2D, type: ConstraintType, data: ConstraintData, skip_solve := false) -> int {
     if sketch.constraints == nil {
         sketch.constraints = make([dynamic]Constraint)
     }
@@ -199,6 +210,11 @@ sketch_add_constraint :: proc(sketch: ^Sketch2D, type: ConstraintType, data: Con
     append(&sketch.constraints, constraint)
     sketch.next_constraint_id += 1
 
+    // 🔧 Solve sketch after adding constraint (unless skipped for auto-constraints)
+    if !skip_solve {
+        solve_sketch(sketch)
+    }
+
     return constraint.id
 }
 
@@ -209,6 +225,10 @@ sketch_remove_constraint :: proc(sketch: ^Sketch2D, constraint_id: int) -> bool 
     for c, i in sketch.constraints {
         if c.id == constraint_id {
             ordered_remove(&sketch.constraints, i)
+
+            // 🔧 Solve sketch after removing constraint
+            solve_sketch(sketch)
+
             return true
         }
     }
@@ -282,6 +302,12 @@ sketch_modify_constraint_value :: proc(sketch: ^Sketch2D, constraint_id: int, ne
             data.angle = clamped  // Store in degrees
             return true
         }
+    case .Diameter:
+        if data, ok := &c.data.(DiameterData); ok {
+            if new_value <= 0 do return false  // Diameter must be positive
+            data.diameter = new_value
+            return true
+        }
     }
 
     return false
@@ -309,6 +335,10 @@ sketch_get_constraint_value :: proc(sketch: ^Sketch2D, constraint_id: int) -> (v
         if data, is_ok := c.data.(AngleData); is_ok {
             // Return angle in degrees (already stored in degrees)
             return data.angle, true
+        }
+    case .Diameter:
+        if data, is_ok := c.data.(DiameterData); is_ok {
+            return data.diameter, true
         }
     }
 
@@ -367,7 +397,7 @@ constraint_equation_count :: proc(type: ConstraintType) -> int {
         return 1  // One equation: |p1 - p2| = d
 
     case .DistanceX, .DistanceY:
-        return 2  // Two equations: one for distance, one for maintaining angle
+        return 1  // One equation: only controls one axis (no angle locking)
 
     case .Angle:
         return 1  // One equation: angle(v1, v2) = theta
@@ -397,10 +427,13 @@ constraint_equation_count :: proc(type: ConstraintType) -> int {
         return 1  // One equation: distance to center = radius
 
     case .FixedPoint:
-        return 2  // Two equations: x = x0, y = y0
+        return 0  // FixedPoint is handled by point.fixed flag, not by solver equations
 
     case .FixedDistance, .FixedAngle:
         return 0  // These just fix parameter values, not point positions
+
+    case .Diameter:
+        return 0  // Diameter sets circle radius, doesn't constrain point positions
     }
 
     return 0
@@ -459,6 +492,10 @@ sketch_evaluate_constraints :: proc(sketch: ^Sketch2D) -> []f64 {
         case PointOnCircleData:
             residuals_point_on_circle(sketch, data, &residuals)
 
+        case DiameterData:
+            // Diameter doesn't generate constraint equations (sets circle radius directly)
+            // Skip - no residuals to add
+
         case TangentData, FixedPointData:
             // These constraint types will be implemented later
             // For now, we skip them
@@ -481,48 +518,98 @@ residuals_coincident :: proc(sketch: ^Sketch2D, data: CoincidentData, residuals:
 }
 
 // Distance constraint residuals: distance between two points = d
+// SMART: If the points are connected by a H/V constrained line, use linear distance instead
 residuals_distance :: proc(sketch: ^Sketch2D, data: DistanceData, residuals: ^[dynamic]f64) {
     p1 := sketch_get_point(sketch, data.point1_id)
     p2 := sketch_get_point(sketch, data.point2_id)
 
     if p1 == nil || p2 == nil do return
 
-    dx := p1.x - p2.x
-    dy := p1.y - p2.y
-    dist := math.sqrt(dx*dx + dy*dy)
+    dx := p2.x - p1.x
+    dy := p2.y - p1.y
 
-    // One equation: |p1 - p2| - d = 0
-    append(residuals, dist - data.distance)
+    // Check if these two points are connected by a Vertical or Horizontal line
+    is_vertical_line := false
+    is_horizontal_line := false
+
+    for entity, idx in sketch.entities {
+        if line, is_line := entity.(SketchLine); is_line {
+            // Check if this line connects our two points
+            connects_points := (line.start_id == data.point1_id && line.end_id == data.point2_id) ||
+                               (line.start_id == data.point2_id && line.end_id == data.point1_id)
+
+            if connects_points {
+                // Check if this line has a Vertical or Horizontal constraint
+                for c in sketch.constraints {
+                    if v_data, is_v := c.data.(VerticalData); is_v {
+                        if v_data.line_id == idx {
+                            is_vertical_line = true
+                            break
+                        }
+                    } else if h_data, is_h := c.data.(HorizontalData); is_h {
+                        if h_data.line_id == idx {
+                            is_horizontal_line = true
+                            break
+                        }
+                    }
+                }
+            }
+
+            if is_vertical_line || is_horizontal_line {
+                break
+            }
+        }
+    }
+
+    // Use simplified equation if H/V constrained
+    if is_horizontal_line {
+        // Horizontal line: use squared distance to avoid abs() derivative issues
+        // Equation: dx² = distance²
+        // This has smooth derivatives and doesn't flip the line direction
+        append(residuals, dx*dx - data.distance*data.distance)
+    } else if is_vertical_line {
+        // Vertical line: use squared distance to avoid abs() derivative issues
+        // Equation: dy² = distance²
+        append(residuals, dy*dy - data.distance*data.distance)
+    } else {
+        // General case: full Euclidean distance
+        dist := math.sqrt(dx*dx + dy*dy)
+        append(residuals, dist - data.distance)
+    }
 }
 
-// DistanceX constraint residuals: horizontal distance = d, maintain angle
+// DistanceX constraint residuals: horizontal distance = d
+// NOTE: Only controls X-distance. Does NOT lock Y-distance (no angle locking).
+// If you want both X and Y controlled, use two separate dimensions (DistanceX + DistanceY)
 residuals_distance_x :: proc(sketch: ^Sketch2D, data: DistanceXData, residuals: ^[dynamic]f64) {
     p1 := sketch_get_point(sketch, data.point1_id)
     p2 := sketch_get_point(sketch, data.point2_id)
 
     if p1 == nil || p2 == nil do return
 
-    // Two equations to maintain angle while controlling X-distance:
-    // 1. (p2.x - p1.x) - d = 0  [controls horizontal distance]
+    // Main equation: (p2.x - p1.x) - d = 0  [controls horizontal distance]
     append(residuals, (p2.x - p1.x) - data.distance)
 
-    // 2. (p2.y - p1.y) - locked_dy = 0  [maintains angle by locking Y-difference]
-    append(residuals, (p2.y - p1.y) - data.locked_dy)
+    // NOTE: We used to lock Y-difference (locked_dy) to maintain angle, but this causes
+    // solver conflicts when editing dimensions. Removed angle-locking behavior.
+    // If angle control is needed, use a separate angle constraint or diagonal distance dimension.
 }
 
-// DistanceY constraint residuals: vertical distance = d, maintain angle
+// DistanceY constraint residuals: vertical distance = d
+// NOTE: Only controls Y-distance. Does NOT lock X-distance (no angle locking).
+// If you want both X and Y controlled, use two separate dimensions (DistanceX + DistanceY)
 residuals_distance_y :: proc(sketch: ^Sketch2D, data: DistanceYData, residuals: ^[dynamic]f64) {
     p1 := sketch_get_point(sketch, data.point1_id)
     p2 := sketch_get_point(sketch, data.point2_id)
 
     if p1 == nil || p2 == nil do return
 
-    // Two equations to maintain angle while controlling Y-distance:
-    // 1. (p2.y - p1.y) - d = 0  [controls vertical distance]
+    // Main equation: (p2.y - p1.y) - d = 0  [controls vertical distance]
     append(residuals, (p2.y - p1.y) - data.distance)
 
-    // 2. (p2.x - p1.x) - locked_dx = 0  [maintains angle by locking X-difference]
-    append(residuals, (p2.x - p1.x) - data.locked_dx)
+    // NOTE: We used to lock X-difference (locked_dx) to maintain angle, but this causes
+    // solver conflicts when editing dimensions. Removed angle-locking behavior.
+    // If angle control is needed, use a separate angle constraint or diagonal distance dimension.
 }
 
 // Horizontal constraint residuals: line must be horizontal

@@ -99,6 +99,10 @@ Sketch2D :: struct {
     second_point_id: int,        // Second point for dimension tool (-1 if none)
     chain_start_point_id: int,   // Original start point of line chain (for auto-close detection)
 
+    // Line tool preview snap state (for constraint application)
+    preview_snap_horizontal: bool,  // True if preview line is snapped horizontal
+    preview_snap_vertical: bool,    // True if preview line is snapped vertical
+
     // Angular dimension tool state
     first_line_id: int,          // First line for angular dimension (-1 if none)
     second_line_id: int,         // Second line for angular dimension (-1 if none)
@@ -258,9 +262,37 @@ sketch_add_circle :: proc(sketch: ^Sketch2D, center_id: int, radius: f64) -> int
         center_id = center_id,
         radius = radius,
     }
+    circle_id := circle.id
     append(&sketch.entities, circle)
     sketch.next_entity_id += 1
-    return circle.id
+
+    // 🔧 AUTO-CONSTRAINT: Automatically add a diameter constraint to lock the radius
+    // This prevents the solver from changing the radius when solving other constraints
+    // The constraint is driving=true (locks the radius to the drawn value)
+    center_pt := sketch_get_point(sketch, center_id)
+    if center_pt != nil {
+        // Calculate offset for dimension placement (outside the circle, to the right)
+        // Place at 1.5x radius to ensure it's clearly outside and not overlapping the circle
+        offset := m.Vec2{center_pt.x + radius * 1.5, center_pt.y}
+
+        diameter_constraint_id := sketch_add_constraint(
+            sketch,
+            .Diameter,
+            DiameterData{
+                circle_id = circle_id,
+                diameter = radius * 2.0,
+                offset = offset,
+            },
+            skip_solve = true,  // 🔧 Don't solve yet - circle still being created
+        )
+
+        // Note: This auto-created constraint is driving=true by default,
+        // which means it actively constrains the circle's diameter
+        fmt.printf("   Auto-constraint: Diameter Ø%.3f added to circle %d (constraint ID: %d)\n",
+            radius * 2.0, circle_id, diameter_constraint_id)
+    }
+
+    return circle_id
 }
 
 // Add an arc to the sketch

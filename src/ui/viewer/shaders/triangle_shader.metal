@@ -1,5 +1,5 @@
-// OhCAD Metal Shaders - Triangle rendering with lighting for shaded mode
-// Uses push constants (uniform data) for MVP, color, and lighting parameters
+// OhCAD Metal Shaders - Triangle rendering with UNIFORM lighting for CAD viewing
+// Simple, flat lighting optimized for technical visualization
 #include <metal_stdlib>
 using namespace metal;
 
@@ -43,42 +43,37 @@ vertex TriangleVertexOut triangle_vertex_main(
     out.position = uniforms.mvp * float4(in.position, 1.0);
 
     // Transform normal to world space (using model matrix)
-    // Note: For non-uniform scaling, we'd need the inverse transpose
-    // But for CAD models with uniform transforms, this works fine
     out.normal = normalize((uniforms.model * float4(in.normal, 0.0)).xyz);
 
-    // Pass world position for fragment shader (if needed for advanced lighting)
+    // Pass world position for fragment shader
     out.worldPos = (uniforms.model * float4(in.position, 1.0)).xyz;
 
     return out;
 }
 
 // =============================================================================
-// Fragment Shader - Dual-Light Phong Model (for CAD viewing)
+// Fragment Shader - UNIFORM LIGHTING for CAD (very simple, everything visible)
 // =============================================================================
 
 fragment float4 triangle_fragment_main(
     TriangleVertexOut in [[stage_in]],
     constant TriangleUniforms& uniforms [[buffer(0)]]
 ) {
-    // Normalize interpolated normal (can become denormalized during rasterization)
+    // Normalize interpolated normal
     float3 normal = normalize(in.normal);
 
-    // Ambient lighting (base illumination for all surfaces)
-    float3 ambient = uniforms.ambientStrength * uniforms.baseColor.rgb;
+    // CAD LIGHTING: 50% ambient + 50% directional = good contrast while keeping shadows visible
+    // This provides clear edge definition without harsh shadows
 
-    // Primary directional light (from upper-right-front)
-    float3 lightDir1 = normalize(-uniforms.lightDir);
-    float diffuseStrength1 = max(dot(normal, lightDir1), 0.0);
-    float3 diffuse1 = diffuseStrength1 * uniforms.baseColor.rgb * 0.6;  // 60% intensity
+    float3 ambient = 0.50 * uniforms.baseColor.rgb;  // 50% base lighting
 
-    // Secondary fill light (from opposite direction - lower-left-back)
-    float3 lightDir2 = -lightDir1;  // Opposite direction
-    float diffuseStrength2 = max(dot(normal, lightDir2), 0.0);
-    float3 diffuse2 = diffuseStrength2 * uniforms.baseColor.rgb * 0.4;  // 40% intensity
+    // Directional component for contrast and depth perception
+    float3 lightDir = normalize(-uniforms.lightDir);
+    float diffuseStrength = max(dot(normal, lightDir), 0.0);
+    float3 diffuse = diffuseStrength * uniforms.baseColor.rgb * 0.50;  // 50% directional
 
-    // Combine ambient + both diffuse lights
-    float3 finalColor = ambient + diffuse1 + diffuse2;
+    // Combine (heavily weighted toward ambient for uniform appearance)
+    float3 finalColor = ambient + diffuse;
 
     // Return final color with alpha
     return float4(finalColor, uniforms.baseColor.a);

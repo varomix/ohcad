@@ -9,7 +9,7 @@ import sketch "../../features/sketch"
 import extrude "../../features/extrude"
 import m "../../core/math"
 import glsl "core:math/linalg/glsl"
-import manifold "../../core/geometry/manifold"
+import occt "../../core/geometry/occt"  // NEW: OCCT for boolean operations
 
 // Cut direction
 CutDirection :: enum {
@@ -20,16 +20,18 @@ CutDirection :: enum {
 
 // Cut parameters
 CutParams :: struct {
-    depth:       f64,            // Cut depth/distance
-    direction:   CutDirection,   // Cut direction
-    base_solid:  ^extrude.SimpleSolid,  // Solid to cut from
+    depth:       f64,                        // Cut depth/distance
+    direction:   CutDirection,               // Cut direction
+    base_solid:  ^extrude.SimpleSolid,       // Tessellated mesh (for backward compatibility, will be deprecated)
+    base_shape:  occt.Shape,                  // NEW: Exact B-Rep geometry for boolean operations
 }
 
 // Cut result
 CutResult :: struct {
-    solid:   ^extrude.SimpleSolid,  // Resulting 3D solid after cut
-    success: bool,                   // Operation success flag
-    message: string,                 // Error/status message
+    occt_shape: occt.Shape,          // NEW: Exact B-Rep geometry result
+    solid:      ^extrude.SimpleSolid,  // Tessellated mesh for rendering
+    success:    bool,                   // Operation success flag
+    message:    string,                 // Error/status message
 }
 
 // =============================================================================
@@ -80,14 +82,15 @@ cut_sketch :: proc(sk: ^sketch.Sketch2D, params: CutParams) -> CutResult {
     fmt.printf("Cutting with closed profile with %d entities, %d points\n",
         len(closed_profile.entities), len(closed_profile.points))
 
-    // Perform boolean subtract
-    solid := boolean_subtract(sk, closed_profile, params)
+    // Perform boolean subtract using OCCT
+    occt_shape, solid := boolean_subtract_occt(sk, closed_profile, params)
 
-    if solid == nil {
-        result.message = "Failed to perform boolean subtract"
+    if occt_shape == nil || solid == nil {
+        result.message = "Failed to perform OCCT boolean subtract"
         return result
     }
 
+    result.occt_shape = occt_shape
     result.solid = solid
     result.success = true
     result.message = "Cut successful"
@@ -96,72 +99,192 @@ cut_sketch :: proc(sk: ^sketch.Sketch2D, params: CutParams) -> CutResult {
 }
 
 // =============================================================================
-// Boolean Subtract Implementation (ManifoldCAD-based)
+// Boolean Subtract Implementation (OCCT-based)
 // =============================================================================
 
-// Boolean subtract - removes cut volume from base solid using ManifoldCAD
+// Boolean subtract using OCCT - removes cut volume from base solid
 // NEW APPROACH:
-// 1. Create cut volume (extrude the cut profile)
-// 2. Use ManifoldCAD to perform proper boolean difference: base - cut
-// 3. Convert result back to SimpleSolid format
-boolean_subtract :: proc(
+// 1. Create 2D wire from sketch profile
+// 2. Extrude wire to create cut volume as OCCT shape
+// 3. Use OCCT boolean difference: base - cut
+// 4. Tessellate result to SimpleSolid for rendering
+// 5. Return both OCCT shape and SimpleSolid
+boolean_subtract_occt :: proc(
     sk: ^sketch.Sketch2D,
     profile: sketch.Profile,
     params: CutParams,
-) -> ^extrude.SimpleSolid {
+) -> (occt.Shape, ^extrude.SimpleSolid) {
 
-    fmt.println("\n🔧 Starting boolean subtract with ManifoldCAD...")
+    fmt.println("\n🔧 Starting OCCT boolean subtract...")
 
-    // Step 1: Create the cut volume (similar to extrude)
-    cut_volume := create_cut_volume(sk, profile, params)
-    if cut_volume == nil {
-        fmt.println("❌ Error: Failed to create cut volume")
-        return nil
+    // Validate base shape exists
+    if params.base_shape == nil {
+        fmt.println("❌ Error: No base OCCT shape provided")
+        return nil, nil
     }
-    defer {
-        // Clean up cut volume after we're done
-        for v in cut_volume.vertices {
-            free(v)
+
+    // Step 1: Create 2D wire from profile points
+    profile_points := get_profile_points_ordered(sk, profile)
+    defer delete(profile_points)
+
+    if len(profile_points) < 3 {
+        fmt.println("❌ Error: Profile must have at least 3 points")
+        return nil, nil
+    }
+
+    // Convert profile points to 3D world coordinates
+    points_3d := make([]f64, len(profile_points) * 3)
+    defer delete(points_3d)
+
+    for point_2d, i in profile_points {
+        point_3d := sketch.sketch_to_world(&sk.plane, point_2d)
+        points_3d[i*3 + 0] = point_3d.x
+        points_3d[i*3 + 1] = point_3d.y
+        points_3d[i*3 + 2] = point_3d.z
+    }
+
+    // Create OCCT wire from 3D points (closed profile)
+    wire := occt.OCCT_Wire_FromPoints3D(raw_data(points_3d), i32(len(profile_points)), true)
+    if wire == nil {
+        fmt.println("❌ Error: Failed to create OCCT wire from profile")
+        return nil, nil
+    }
+    defer occt.OCCT_Wire_Delete(wire)
+
+    fmt.printf("✅ Created OCCT wire from %d points\n", len(profile_points))
+
+    // Step 2: Calculate cut extrusion vector
+    cut_offset := calculate_cut_offset(&sk.plane, params)
+
+    // Step 3: Extrude wire to create cut volume
+    cut_shape := occt.OCCT_Extrude_Wire(wire, cut_offset.x, cut_offset.y, cut_offset.z)
+    if cut_shape == nil {
+        fmt.println("❌ Error: Failed to extrude cut profile")
+        return nil, nil
+    }
+    defer occt.delete_shape(cut_shape)
+
+    fmt.println("✅ Created cut volume via OCCT extrusion")
+
+    // Step 4: Perform boolean difference (base - cut)
+    result_shape := occt.OCCT_Boolean_Difference(params.base_shape, cut_shape)
+    if result_shape == nil {
+        fmt.println("❌ Error: OCCT boolean difference failed")
+        return nil, nil
+    }
+
+    // Validate result
+    if !occt.is_valid(result_shape) {
+        fmt.println("❌ Error: Boolean result shape is invalid")
+        occt.delete_shape(result_shape)
+        return nil, nil
+    }
+
+    fmt.println("✅ OCCT boolean difference succeeded")
+
+    // Step 5: Tessellate result to SimpleSolid for rendering
+    mesh := occt.OCCT_Tessellate(result_shape, occt.DEFAULT_TESSELLATION)
+    if mesh == nil {
+        fmt.println("❌ Error: Failed to tessellate cut result")
+        occt.delete_shape(result_shape)
+        return nil, nil
+    }
+    defer occt.delete_mesh(mesh)
+
+    fmt.printf("✅ Tessellated result: %d vertices, %d triangles\n",
+        mesh.num_vertices, mesh.num_triangles)
+
+    // Step 6: Convert mesh to SimpleSolid
+    solid := occt_mesh_to_simple_solid(mesh)
+    if solid == nil {
+        fmt.println("❌ Error: Failed to convert mesh to SimpleSolid")
+        occt.delete_shape(result_shape)
+        return nil, nil
+    }
+
+    fmt.printf("✅ OCCT boolean subtract complete: %d vertices, %d triangles\n",
+        len(solid.vertices), len(solid.triangles))
+
+    // Return both OCCT shape (don't delete - caller owns it) and SimpleSolid
+    return result_shape, solid
+}
+
+// Convert OCCT mesh to SimpleSolid (same as primitives module)
+occt_mesh_to_simple_solid :: proc(mesh: ^occt.Mesh) -> ^extrude.SimpleSolid {
+    solid := new(extrude.SimpleSolid)
+
+    // Extract triangles from OCCT mesh
+    solid.triangles = make([dynamic]extrude.Triangle3D, 0, int(mesh.num_triangles))
+
+    for i in 0..<int(mesh.num_triangles) {
+        // Get triangle vertex indices
+        idx0 := mesh.triangles[i*3 + 0]
+        idx1 := mesh.triangles[i*3 + 1]
+        idx2 := mesh.triangles[i*3 + 2]
+
+        // Get vertex positions
+        v0 := m.Vec3{
+            f64(mesh.vertices[idx0*3 + 0]),
+            f64(mesh.vertices[idx0*3 + 1]),
+            f64(mesh.vertices[idx0*3 + 2]),
         }
-        delete(cut_volume.vertices)
-        for e in cut_volume.edges {
-            free(e)
+
+        v1 := m.Vec3{
+            f64(mesh.vertices[idx1*3 + 0]),
+            f64(mesh.vertices[idx1*3 + 1]),
+            f64(mesh.vertices[idx1*3 + 2]),
         }
-        delete(cut_volume.edges)
-        delete(cut_volume.faces)
-        delete(cut_volume.triangles)
-        free(cut_volume)
+
+        v2 := m.Vec3{
+            f64(mesh.vertices[idx2*3 + 0]),
+            f64(mesh.vertices[idx2*3 + 1]),
+            f64(mesh.vertices[idx2*3 + 2]),
+        }
+
+        // Get vertex normals (OCCT provides per-vertex normals for smooth shading)
+        n0 := m.Vec3{
+            f64(mesh.normals[idx0*3 + 0]),
+            f64(mesh.normals[idx0*3 + 1]),
+            f64(mesh.normals[idx0*3 + 2]),
+        }
+
+        n1 := m.Vec3{
+            f64(mesh.normals[idx1*3 + 0]),
+            f64(mesh.normals[idx1*3 + 1]),
+            f64(mesh.normals[idx1*3 + 2]),
+        }
+
+        n2 := m.Vec3{
+            f64(mesh.normals[idx2*3 + 0]),
+            f64(mesh.normals[idx2*3 + 1]),
+            f64(mesh.normals[idx2*3 + 2]),
+        }
+
+        // Calculate face normal (average of vertex normals)
+        face_normal := (n0 + n1 + n2) / 3.0
+
+        // DEBUG: Print first few normals to verify they're correct
+        if i < 5 {
+            fmt.printf("🔍 Cut triangle %d: normal=(%.3f, %.3f, %.3f)\n",
+                i, face_normal.x, face_normal.y, face_normal.z)
+        }
+
+        // Create triangle
+        tri := extrude.Triangle3D{
+            v0 = v0,
+            v1 = v1,
+            v2 = v2,
+            normal = face_normal,
+            face_id = -1,
+        }
+
+        append(&solid.triangles, tri)
     }
 
-    // Ensure cut volume has triangles
-    if len(cut_volume.triangles) == 0 {
-        fmt.println("🔧 Generating triangles for cut volume...")
-        cut_volume.triangles = extrude.generate_face_triangles(cut_volume)
-    }
+    // Extract feature edges from triangles (for wireframe rendering)
+    extrude.extract_feature_edges_from_mesh(solid)
 
-    fmt.printf("✅ Cut volume created: %d vertices, %d triangles\n",
-               len(cut_volume.vertices), len(cut_volume.triangles))
-
-    // Step 2: Perform ManifoldCAD boolean subtraction
-    result_triangles, success := manifold.boolean_subtract_solids(params.base_solid, cut_volume)
-    if !success {
-        fmt.println("❌ ManifoldCAD boolean subtraction failed")
-        return nil
-    }
-
-    // Step 3: Create result solid with new triangles
-    // We need to generate vertices and edges from the ManifoldCAD triangle mesh
-    result := build_solid_from_triangles(result_triangles)
-    if result == nil {
-        fmt.println("❌ Error: Failed to build solid from triangles")
-        delete(result_triangles)
-        return nil
-    }
-
-    fmt.printf("✅ Boolean subtraction complete: %d vertices, %d edges, %d triangles\n",
-                len(result.vertices), len(result.edges), len(result.triangles))
-
-    return result
+    return solid
 }
 
 // Create the cut volume solid (extruded profile to be subtracted)

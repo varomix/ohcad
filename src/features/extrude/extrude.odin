@@ -4,11 +4,13 @@ package ohcad_extrude
 
 import "core:fmt"
 import "core:slice"
+import "core:math"
 import sketch "../../features/sketch"
 import topo "../../core/topology"
 import m "../../core/math"
 import glsl "core:math/linalg/glsl"
 import tess "../../core/tessellation"
+import occt "../../core/geometry/occt"
 
 // Extrude direction
 ExtrudeDirection :: enum {
@@ -25,9 +27,10 @@ ExtrudeParams :: struct {
 
 // Extrude result
 ExtrudeResult :: struct {
-    solid:   ^SimpleSolid,  // Resulting 3D solid (simplified wireframe)
-    success: bool,           // Operation success flag
-    message: string,         // Error/status message
+    occt_shape: occt.Shape,      // NEW: Exact B-Rep geometry for boolean/fillet/chamfer operations
+    solid:      ^SimpleSolid,    // Tessellated mesh for rendering
+    success:    bool,            // Operation success flag
+    message:    string,          // Error/status message
 }
 
 // =============================================================================
@@ -106,14 +109,23 @@ extrude_sketch :: proc(sk: ^sketch.Sketch2D, params: ExtrudeParams) -> ExtrudeRe
     fmt.printf("Extruding closed profile with %d entities, %d points\n",
         len(closed_profile.entities), len(closed_profile.points))
 
-    // Create solid from profile
-    solid := extrude_profile(sk, closed_profile, params)
+    // Create solid from profile (returns both OCCT shape and SimpleSolid)
+    occt_shape, solid := extrude_profile(sk, closed_profile, params)
 
-    if solid == nil {
+    if occt_shape == nil || solid == nil {
         result.message = "Failed to create solid from profile"
+        // Clean up if partial result
+        if occt_shape != nil {
+            occt.delete_shape(occt_shape)
+        }
+        if solid != nil {
+            extrude_result_destroy(&ExtrudeResult{solid = solid})
+        }
         return result
     }
 
+    // Store both exact geometry and tessellated mesh
+    result.occt_shape = occt_shape
     result.solid = solid
     result.success = true
     result.message = "Extrude successful"
@@ -121,12 +133,12 @@ extrude_sketch :: proc(sk: ^sketch.Sketch2D, params: ExtrudeParams) -> ExtrudeRe
     return result
 }
 
-// Extrude a single closed profile
+// Extrude a single closed profile using OCCT
 extrude_profile :: proc(
     sk: ^sketch.Sketch2D,
     profile: sketch.Profile,
     params: ExtrudeParams,
-) -> ^SimpleSolid {
+) -> (occt.Shape, ^SimpleSolid) {
 
     // Calculate extrusion vector
     extrude_offset := calculate_extrude_offset(&sk.plane, params)
@@ -137,100 +149,328 @@ extrude_profile :: proc(
 
     if len(profile_points) < 3 {
         fmt.println("Error: Profile must have at least 3 points")
-        return nil
+        return nil, nil
     }
 
-    // Create solid
-    solid := new(SimpleSolid)
-    solid.vertices = make([dynamic]^Vertex, 0, len(profile_points) * 2)
-    solid.edges = make([dynamic]^Edge, 0, len(profile_points) * 3)
+    fmt.printf("🔧 Extruding %d-point profile using OCCT...\n", len(profile_points))
 
-    // Create bottom vertices (on sketch plane)
-    bottom_vertices := make([dynamic]^Vertex, 0, len(profile_points))
-    defer delete(bottom_vertices)
+    // Use OCCT to perform extrusion and get both shape and mesh
+    occt_result := occt.extrude_profile_2d(profile_points[:], extrude_offset)
 
-    for point_2d in profile_points {
-        point_3d := sketch.sketch_to_world(&sk.plane, point_2d)
-        vertex := new(Vertex)
-        vertex.position = point_3d
-        append(&solid.vertices, vertex)
-        append(&bottom_vertices, vertex)
+    if occt_result.shape == nil || occt_result.mesh == nil {
+        fmt.println("❌ OCCT extrusion failed")
+        // Clean up if partial result
+        if occt_result.shape != nil {
+            occt.delete_shape(occt_result.shape)
+        }
+        if occt_result.mesh != nil {
+            occt.delete_mesh(occt_result.mesh)
+        }
+        return nil, nil
+    }
+    defer occt.delete_mesh(occt_result.mesh)  // Clean up mesh after conversion
+
+    // Convert OCCT mesh to SimpleSolid
+    solid := occt_mesh_to_simple_solid(occt_result.mesh)
+
+    if solid == nil {
+        fmt.println("❌ Failed to convert OCCT mesh to SimpleSolid")
+        occt.delete_shape(occt_result.shape)
+        return nil, nil
     }
 
-    // Create top vertices (offset by extrude vector)
-    top_vertices := make([dynamic]^Vertex, 0, len(profile_points))
-    defer delete(top_vertices)
+    // Create faces for selection/sketching (OCCT doesn't provide face metadata)
+    // We'll generate simplified face data for top/bottom planes
+    add_face_metadata(solid, sk, profile_points[:], extrude_offset)
 
-    for point_2d in profile_points {
-        point_3d := sketch.sketch_to_world(&sk.plane, point_2d)
-        extruded_point := point_3d + extrude_offset
-        vertex := new(Vertex)
-        vertex.position = extruded_point
-        append(&solid.vertices, vertex)
-        append(&top_vertices, vertex)
-    }
+    fmt.printf("✅ Created OCCT-extruded solid: %d vertices, %d edges, %d triangles\n",
+        len(solid.vertices), len(solid.edges), len(solid.triangles))
 
-    // Create bottom edges (connecting bottom vertices in a loop)
-    for i in 0..<len(bottom_vertices) {
-        next_i := (i + 1) % len(bottom_vertices)
-        edge := new(Edge)
-        edge.v0 = bottom_vertices[i]
-        edge.v1 = bottom_vertices[next_i]
-        append(&solid.edges, edge)
-    }
-
-    // Create top edges (connecting top vertices in a loop)
-    for i in 0..<len(top_vertices) {
-        next_i := (i + 1) % len(top_vertices)
-        edge := new(Edge)
-        edge.v0 = top_vertices[i]
-        edge.v1 = top_vertices[next_i]
-        append(&solid.edges, edge)
-    }
-
-    // Create vertical edges (connecting bottom to top)
-    for i in 0..<len(bottom_vertices) {
-        edge := new(Edge)
-        edge.v0 = bottom_vertices[i]
-        edge.v1 = top_vertices[i]
-        append(&solid.edges, edge)
-    }
-
-    // NEW: Create faces for selection/sketching
-    solid.faces = make([dynamic]SimpleFace, 0, 2 + len(profile_points))
-
-    // Create bottom face
-    bottom_face := create_bottom_face(bottom_vertices[:], sk.plane.normal)
-    append(&solid.faces, bottom_face)
-
-    // Create top face
-    top_face := create_top_face(top_vertices[:], sk.plane.normal, extrude_offset)
-    append(&solid.faces, top_face)
-
-    // Create side faces (one for each edge of the profile)
-    for i in 0..<len(bottom_vertices) {
-        next_i := (i + 1) % len(bottom_vertices)
-        side_face := create_side_face(
-            bottom_vertices[i], bottom_vertices[next_i],
-            top_vertices[i], top_vertices[next_i],
-            i,
-        )
-        append(&solid.faces, side_face)
-    }
-
-    fmt.printf("✅ Created extruded solid: %d vertices, %d edges, %d faces\n",
-        len(solid.vertices), len(solid.edges), len(solid.faces))
-
-    // NEW: Generate triangle mesh for rendering
-    solid.triangles = generate_face_triangles(solid)
-    fmt.printf("✅ Generated %d triangles for shaded rendering\n", len(solid.triangles))
-
-    return solid
+    // Return both OCCT shape (exact geometry) and SimpleSolid (tessellated mesh)
+    return occt_result.shape, solid
 }
 
 // =============================================================================
 // Face Generation Helpers
 // =============================================================================
+
+// Add face metadata to OCCT-generated solid for selection/sketching
+add_face_metadata :: proc(
+    solid: ^SimpleSolid,
+    sk: ^sketch.Sketch2D,
+    profile_points: []m.Vec2,
+    extrude_offset: m.Vec3,
+) {
+    solid.faces = make([dynamic]SimpleFace, 0, 2)
+
+    // Create bottom face with actual vertices from profile
+    bottom_face: SimpleFace
+    bottom_face.vertices = make([dynamic]^Vertex, 0, len(profile_points))
+    bottom_face.normal = -sk.plane.normal
+    bottom_face.center = sk.plane.origin
+    bottom_face.name = "Bottom"
+
+    // Populate bottom face vertices (on sketch plane, reversed winding for downward normal)
+    for i := len(profile_points) - 1; i >= 0; i -= 1 {
+        point_2d := profile_points[i]
+        point_3d := sketch.sketch_to_world(&sk.plane, point_2d)
+
+        // Find or create vertex in solid
+        vertex := find_or_create_vertex(solid, point_3d)
+        append(&bottom_face.vertices, vertex)
+    }
+
+    append(&solid.faces, bottom_face)
+
+    // Create top face with actual vertices
+    top_face: SimpleFace
+    top_face.vertices = make([dynamic]^Vertex, 0, len(profile_points))
+    top_face.normal = sk.plane.normal
+    top_face.center = sk.plane.origin + extrude_offset
+    top_face.name = "Top"
+
+    // Populate top face vertices (offset by extrude_offset)
+    for point_2d in profile_points {
+        point_3d := sketch.sketch_to_world(&sk.plane, point_2d)
+        top_point := point_3d + extrude_offset
+
+        // Find or create vertex in solid
+        vertex := find_or_create_vertex(solid, top_point)
+        append(&top_face.vertices, vertex)
+    }
+
+    append(&solid.faces, top_face)
+
+    fmt.printf("✅ Added face metadata: %d faces (%d vertices each)\n",
+        len(solid.faces), len(profile_points))
+}
+
+// Find existing vertex or create new one
+find_or_create_vertex :: proc(solid: ^SimpleSolid, position: m.Vec3) -> ^Vertex {
+    EPSILON :: 0.0001
+
+    // Search for existing vertex at this position
+    for vertex in solid.vertices {
+        diff := vertex.position - position
+        dist_sq := diff.x*diff.x + diff.y*diff.y + diff.z*diff.z
+        if dist_sq < EPSILON * EPSILON {
+            return vertex
+        }
+    }
+
+    // Create new vertex
+    vertex := new(Vertex)
+    vertex.position = position
+    append(&solid.vertices, vertex)
+    return vertex
+}
+
+// Convert OCCT tessellated mesh to SimpleSolid format
+occt_mesh_to_simple_solid :: proc(mesh: ^occt.Mesh) -> ^SimpleSolid {
+    if mesh == nil || mesh.num_vertices == 0 || mesh.num_triangles == 0 {
+        return nil
+    }
+
+    solid := new(SimpleSolid)
+
+    // Extract triangles from OCCT mesh
+    solid.triangles = make([dynamic]Triangle3D, 0, int(mesh.num_triangles))
+
+    for i in 0..<int(mesh.num_triangles) {
+        // Get triangle vertex indices
+        idx0 := mesh.triangles[i*3 + 0]
+        idx1 := mesh.triangles[i*3 + 1]
+        idx2 := mesh.triangles[i*3 + 2]
+
+        // Get vertex positions
+        v0 := m.Vec3{
+            f64(mesh.vertices[idx0*3 + 0]),
+            f64(mesh.vertices[idx0*3 + 1]),
+            f64(mesh.vertices[idx0*3 + 2]),
+        }
+
+        v1 := m.Vec3{
+            f64(mesh.vertices[idx1*3 + 0]),
+            f64(mesh.vertices[idx1*3 + 1]),
+            f64(mesh.vertices[idx1*3 + 2]),
+        }
+
+        v2 := m.Vec3{
+            f64(mesh.vertices[idx2*3 + 0]),
+            f64(mesh.vertices[idx2*3 + 1]),
+            f64(mesh.vertices[idx2*3 + 2]),
+        }
+
+        // Get vertex normals (OCCT provides per-vertex normals for smooth shading)
+        n0 := m.Vec3{
+            f64(mesh.normals[idx0*3 + 0]),
+            f64(mesh.normals[idx0*3 + 1]),
+            f64(mesh.normals[idx0*3 + 2]),
+        }
+
+        n1 := m.Vec3{
+            f64(mesh.normals[idx1*3 + 0]),
+            f64(mesh.normals[idx1*3 + 1]),
+            f64(mesh.normals[idx1*3 + 2]),
+        }
+
+        n2 := m.Vec3{
+            f64(mesh.normals[idx2*3 + 0]),
+            f64(mesh.normals[idx2*3 + 1]),
+            f64(mesh.normals[idx2*3 + 2]),
+        }
+
+        // Calculate face normal (average of vertex normals)
+        face_normal := (n0 + n1 + n2) / 3.0
+
+        // Create triangle
+        tri := Triangle3D{
+            v0 = v0,
+            v1 = v1,
+            v2 = v2,
+            normal = face_normal,
+            face_id = 0,  // OCCT doesn't distinguish faces in tessellation
+        }
+
+        append(&solid.triangles, tri)
+    }
+
+    // Extract feature edges from triangles
+    extract_feature_edges_from_mesh(solid)
+
+    return solid
+}
+
+// Extract wireframe edges from triangle mesh (feature edges only)
+// This creates clean CAD-style wireframes without tessellation clutter
+extract_feature_edges_from_mesh :: proc(solid: ^SimpleSolid) {
+    if len(solid.triangles) == 0 {
+        return
+    }
+
+    SHARP_EDGE_THRESHOLD :: 30.0  // degrees
+
+    // Build vertex map and edge adjacency
+    vertex_map := make(map[[3]f64]^Vertex)
+    defer delete(vertex_map)
+
+    solid.vertices = make([dynamic]^Vertex, 0, len(solid.triangles) * 3)
+
+    // Helper to get or create vertex
+    get_or_create_vertex :: proc(
+        pos: m.Vec3,
+        vertex_map: ^map[[3]f64]^Vertex,
+        vertices: ^[dynamic]^Vertex,
+    ) -> ^Vertex {
+        key := [3]f64{pos.x, pos.y, pos.z}
+
+        if v, exists := vertex_map[key]; exists {
+            return v
+        }
+
+        v := new(Vertex)
+        v.position = pos
+        append(vertices, v)
+        vertex_map[key] = v
+        return v
+    }
+
+    // Edge adjacency tracking
+    EdgeKey :: struct {
+        v0, v1: rawptr,
+    }
+
+    EdgeInfo :: struct {
+        v0, v1: ^Vertex,
+        triangles: [dynamic]int,
+    }
+
+    edge_map := make(map[EdgeKey]EdgeInfo)
+    defer {
+        for _, info in edge_map {
+            delete(info.triangles)
+        }
+        delete(edge_map)
+    }
+
+    // Build edge adjacency from triangles
+    for tri, tri_idx in solid.triangles {
+        v0 := get_or_create_vertex(tri.v0, &vertex_map, &solid.vertices)
+        v1 := get_or_create_vertex(tri.v1, &vertex_map, &solid.vertices)
+        v2 := get_or_create_vertex(tri.v2, &vertex_map, &solid.vertices)
+
+        add_edge :: proc(
+            edge_map: ^map[EdgeKey]EdgeInfo,
+            v0, v1: ^Vertex,
+            tri_idx: int,
+        ) {
+            v0_ptr := rawptr(v0)
+            v1_ptr := rawptr(v1)
+
+            key: EdgeKey
+            if uintptr(v0_ptr) < uintptr(v1_ptr) {
+                key = EdgeKey{v0_ptr, v1_ptr}
+            } else {
+                key = EdgeKey{v1_ptr, v0_ptr}
+            }
+
+            if info, exists := &edge_map[key]; exists {
+                append(&info.triangles, tri_idx)
+            } else {
+                info := EdgeInfo{
+                    v0 = v0,
+                    v1 = v1,
+                    triangles = make([dynamic]int, 0, 2),
+                }
+                append(&info.triangles, tri_idx)
+                edge_map[key] = info
+            }
+        }
+
+        add_edge(&edge_map, v0, v1, tri_idx)
+        add_edge(&edge_map, v1, v2, tri_idx)
+        add_edge(&edge_map, v2, v0, tri_idx)
+    }
+
+    // Extract feature edges (boundary + sharp edges)
+    solid.edges = make([dynamic]^Edge, 0, len(edge_map))
+
+    for _, info in edge_map {
+        is_feature := false
+
+        if len(info.triangles) == 1 {
+            // Boundary edge
+            is_feature = true
+        } else if len(info.triangles) == 2 {
+            // Check if sharp edge
+            tri0 := solid.triangles[info.triangles[0]]
+            tri1 := solid.triangles[info.triangles[1]]
+
+            dot := glsl.dot(tri0.normal, tri1.normal)
+            angle_rad := math.acos(glsl.clamp(dot, -1.0, 1.0))
+            angle_deg := angle_rad * 180.0 / math.PI
+
+            if angle_deg > SHARP_EDGE_THRESHOLD {
+                is_feature = true
+            }
+        } else if len(info.triangles) > 2 {
+            // Non-manifold edge
+            is_feature = true
+        }
+
+        if is_feature {
+            edge := new(Edge)
+            edge.v0 = info.v0
+            edge.v1 = info.v1
+            append(&solid.edges, edge)
+        }
+    }
+
+    fmt.printf("🔧 Extracted %d feature edges from %d triangles\n",
+        len(solid.edges), len(solid.triangles))
+}
+
+
 
 // Create bottom face (on original sketch plane)
 create_bottom_face :: proc(vertices: []^Vertex, sketch_normal: m.Vec3) -> SimpleFace {

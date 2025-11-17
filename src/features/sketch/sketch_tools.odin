@@ -121,8 +121,42 @@ handle_line_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
 
         // Don't create line if start and end are the same point
         if sketch.first_point_id != end_point_id {
-            sketch_add_line(sketch, sketch.first_point_id, end_point_id)
+            line_id := sketch_add_line(sketch, sketch.first_point_id, end_point_id)
             fmt.printf("Line tool: Line created from point %d to %d\n", sketch.first_point_id, end_point_id)
+
+            // AUTO-APPLY CONSTRAINTS: If the preview was snapped to horizontal/vertical, apply the constraint
+            constraint_applied := false
+            if sketch.preview_snap_horizontal {
+                // Find the entity index for the line we just created
+                line_entity_index := len(sketch.entities) - 1
+                sketch_add_constraint(sketch, .Horizontal, HorizontalData{
+                    line_id = line_entity_index,
+                })
+                fmt.println("  ✅ Auto-applied Horizontal constraint")
+                constraint_applied = true
+            } else if sketch.preview_snap_vertical {
+                // Find the entity index for the line we just created
+                line_entity_index := len(sketch.entities) - 1
+                sketch_add_constraint(sketch, .Vertical, VerticalData{
+                    line_id = line_entity_index,
+                })
+                fmt.println("  ✅ Auto-applied Vertical constraint")
+                constraint_applied = true
+            }
+
+            // SOLVE CONSTRAINTS: If we applied a constraint, solve immediately to snap the line
+            if constraint_applied {
+                result := sketch_solve_constraints(sketch)
+                if result.status == .Success {
+                    fmt.println("  🔧 Constraint solved - line snapped to position")
+                } else {
+                    fmt.printf("  ⚠️  Solver status: %v (constraint added but geometry may not be exact)\n", result.status)
+                }
+            }
+
+            // Reset snap state after creating line
+            sketch.preview_snap_horizontal = false
+            sketch.preview_snap_vertical = false
 
             // CHAIN: Continue from this endpoint (like OnShape)
             // Set the endpoint as the new start point for the next line
@@ -192,6 +226,47 @@ sketch_find_nearest_point :: proc(sketch: ^Sketch2D, pos: m.Vec2, threshold: f64
     return nearest_id, nearest_id != -1
 }
 
+// Find nearest point with PRIORITY for circle centers (larger tolerance for centers)
+// This makes it easier to dimension from circle centers even when near the circle edge
+sketch_find_nearest_point_prioritize_centers :: proc(sketch: ^Sketch2D, pos: m.Vec2, point_threshold: f64 = 0.1, center_threshold: f64 = 0.5) -> (int, bool) {
+    // First pass: check circle centers with larger threshold
+    min_dist := center_threshold
+    nearest_id := -1
+
+    // Check all circle centers first (with larger tolerance)
+    for entity in sketch.entities {
+        if circle, is_circle := entity.(SketchCircle); is_circle {
+            center_pt := sketch_get_point(sketch, circle.center_id)
+            if center_pt != nil {
+                p := m.Vec2{center_pt.x, center_pt.y}
+                dist := glsl.length(pos - p)
+                if dist < min_dist {
+                    min_dist = dist
+                    nearest_id = circle.center_id
+                }
+            }
+        }
+    }
+
+    // If we found a circle center, return it
+    if nearest_id != -1 {
+        return nearest_id, true
+    }
+
+    // Second pass: check all other points with normal threshold
+    min_dist = point_threshold
+    for point in sketch.points {
+        p := m.Vec2{point.x, point.y}
+        dist := glsl.length(pos - p)
+        if dist < min_dist {
+            min_dist = dist
+            nearest_id = point.id
+        }
+    }
+
+    return nearest_id, nearest_id != -1
+}
+
 // Find nearest line entity to given position (for edge selection)
 sketch_find_nearest_line :: proc(sketch: ^Sketch2D, pos: m.Vec2, threshold: f64 = 0.15) -> (entity_id: int, start_pt_id: int, end_pt_id: int, found: bool) {
     min_dist := threshold
@@ -234,6 +309,38 @@ sketch_find_nearest_line :: proc(sketch: ^Sketch2D, pos: m.Vec2, threshold: f64 
     }
 
     return nearest_entity, nearest_start, nearest_end, nearest_entity != -1
+}
+
+// Find nearest circle entity to given position (for diameter dimension)
+sketch_find_nearest_circle :: proc(sketch: ^Sketch2D, pos: m.Vec2, threshold: f64 = 0.15) -> (entity_id: int, center_pt_id: int, found: bool) {
+    // Use a larger detection band for better UX (3x threshold on each side of circle edge)
+    detection_band := threshold * 3.0
+    min_dist := detection_band
+    nearest_entity := -1
+    nearest_center := -1
+
+    for entity, idx in sketch.entities {
+        #partial switch e in entity {
+        case SketchCircle:
+            center_pt := sketch_get_point(sketch, e.center_id)
+
+            if center_pt != nil {
+                center_2d := m.Vec2{center_pt.x, center_pt.y}
+
+                // Calculate distance from click position to circle edge
+                dist_to_center := glsl.length(pos - center_2d)
+                dist_to_edge := math.abs(dist_to_center - e.radius)
+
+                if dist_to_edge < min_dist {
+                    min_dist = dist_to_edge
+                    nearest_entity = idx
+                    nearest_center = e.center_id
+                }
+            }
+        }
+    }
+
+    return nearest_entity, nearest_center, nearest_entity != -1
 }
 
 // Snap position to grid
@@ -415,11 +522,12 @@ sketch_delete_point :: proc(sketch: ^Sketch2D, point_id: int) {
 // - Distance: Click point → point → placement
 // - Distance from edge: Click edge → placement
 // - Angular: Click line → line → placement
-// - Diameter: Click circle → placement (TODO)
+// - Diameter: Click circle → placement
 handle_dimension_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
     // Snap threshold - if clicking within 0.2 units of existing point, snap to it
     SNAP_THRESHOLD :: 0.2
     EDGE_SELECT_THRESHOLD :: 0.15
+    CIRCLE_SELECT_THRESHOLD :: 0.15
 
     // DEBUG: Print current state
     fmt.printf("🐛 DEBUG: first_point_id=%d, second_point_id=%d, first_line_id=%d, second_line_id=%d\n",
@@ -430,7 +538,8 @@ handle_dimension_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
     // ==========================================================================
     if sketch.first_point_id == -1 && sketch.first_line_id == -1 {
         // Try point selection first (points have priority)
-        snapped_id, point_found := sketch_find_nearest_point(sketch, click_pos, SNAP_THRESHOLD)
+        // Use center-prioritized search to make circle centers easier to select
+        snapped_id, point_found := sketch_find_nearest_point_prioritize_centers(sketch, click_pos, SNAP_THRESHOLD, SNAP_THRESHOLD * 2.5)
 
         if point_found {
             // DISTANCE DIMENSION MODE: Point selected
@@ -464,8 +573,30 @@ handle_dimension_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
             }
         }
 
+        // No line found, try to find a nearby CIRCLE
+        circle_entity_id, circle_center_id, circle_found := sketch_find_nearest_circle(sketch, click_pos, CIRCLE_SELECT_THRESHOLD)
+
+        if circle_found {
+            entity := sketch.entities[circle_entity_id]
+            if circle, is_circle := entity.(SketchCircle); is_circle {
+                // CIRCLE SELECTED - enter diameter dimension mode
+                // Store circle entity ID in first_line_id (reusing existing state variable)
+                // This signals we're in diameter mode, not distance/angular mode
+                sketch.first_line_id = circle_entity_id
+                // Mark as diameter mode by setting first_point_id to a special value
+                // (we'll check for this pattern: first_line_id >= 0 && first_point_id == -1 && second_point_id == -1)
+
+                center_pt := sketch_get_point(sketch, circle_center_id)
+                fmt.printf("Dimension: Circle selected (Entity ID=%d)\n", circle_entity_id)
+                fmt.printf("  → Center: (%.3f, %.3f), Radius: %.3f, Diameter: %.3f\n",
+                    center_pt.x, center_pt.y, circle.radius, circle.radius * 2.0)
+                fmt.println("  → Click to place diameter dimension")
+                return
+            }
+        }
+
         // Nothing found
-        fmt.println("❌ No point or edge found - click near an existing point or edge")
+        fmt.println("❌ No point, edge, or circle found - click near existing geometry")
         return
     }
 
@@ -508,28 +639,39 @@ handle_dimension_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
     // ==========================================================================
     if sketch.first_line_id >= 0 && sketch.second_line_id == -1 &&
        sketch.first_point_id == -1 && sketch.second_point_id == -1 {
-        // This path is unlikely now, but keep for safety
-        // Try to find another line
-        entity_id, _, _, line_found := sketch_find_nearest_line(sketch, click_pos, EDGE_SELECT_THRESHOLD)
 
-        if line_found {
-            entity := sketch.entities[entity_id]
-            if _, is_line := entity.(SketchLine); is_line {
-                if entity_id == sketch.first_line_id {
-                    fmt.println("❌ Cannot measure angle of the same line - select a different line")
-                    return
+        // Verify first_line_id is actually a LINE, not a circle
+        // (If it's a circle, this is diameter mode, not angular mode)
+        if sketch.first_line_id < len(sketch.entities) {
+            entity := sketch.entities[sketch.first_line_id]
+            if _, is_circle := entity.(SketchCircle); is_circle {
+                // This is a circle, not a line - fall through to diameter mode
+                // (handled later in CLICK 2b: DIAMETER MODE)
+            } else if _, is_line := entity.(SketchLine); is_line {
+                // This is a line - proceed with angular dimension logic
+                // Try to find another line
+                entity_id, _, _, line_found := sketch_find_nearest_line(sketch, click_pos, EDGE_SELECT_THRESHOLD)
+
+                if line_found {
+                    entity2 := sketch.entities[entity_id]
+                    if _, is_line2 := entity2.(SketchLine); is_line2 {
+                        if entity_id == sketch.first_line_id {
+                            fmt.println("❌ Cannot measure angle of the same line - select a different line")
+                            return
+                        }
+
+                        sketch.second_line_id = entity_id
+                        fmt.printf("Dimension (Angular): Second line selected (Entity ID=%d)\n", entity_id)
+                        fmt.println("  → Click to position angular dimension arc")
+                        return
+                    }
                 }
 
-                sketch.second_line_id = entity_id
-                fmt.printf("Dimension (Angular): Second line selected (Entity ID=%d)\n", entity_id)
-                fmt.println("  → Click to position angular dimension arc")
+                // No line found
+                fmt.println("❌ No line found - click on a line")
                 return
             }
         }
-
-        // No line found
-        fmt.println("❌ No line found - click on a line")
-        return
     }
 
     // ==========================================================================
@@ -537,7 +679,8 @@ handle_dimension_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
     // ==========================================================================
     if sketch.first_point_id >= 0 && sketch.second_point_id == -1 {
         // Try POINT selection first (points have priority)
-        snapped_id, point_found := sketch_find_nearest_point(sketch, click_pos, SNAP_THRESHOLD)
+        // Use center-prioritized search to make circle centers easier to select
+        snapped_id, point_found := sketch_find_nearest_point_prioritize_centers(sketch, click_pos, SNAP_THRESHOLD, SNAP_THRESHOLD * 2.5)
 
         if point_found {
             if snapped_id == sketch.first_point_id {
@@ -615,6 +758,59 @@ handle_dimension_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
     }
 
     // ==========================================================================
+    // CLICK 2b: DIAMETER MODE - Place diameter dimension
+    // ==========================================================================
+    // Pattern: first_line_id >= 0 (circle entity ID), no points selected, no second line
+    if sketch.first_line_id >= 0 && sketch.second_line_id == -1 &&
+       sketch.first_point_id == -1 && sketch.second_point_id == -1 {
+
+        // Verify the entity is still a circle
+        if sketch.first_line_id < 0 || sketch.first_line_id >= len(sketch.entities) {
+            fmt.println("❌ Invalid circle entity ID")
+            sketch.first_line_id = -1
+            return
+        }
+
+        entity := sketch.entities[sketch.first_line_id]
+        circle, ok := entity.(SketchCircle)
+        if !ok {
+            fmt.println("❌ Entity is not a circle")
+            sketch.first_line_id = -1
+            return
+        }
+
+        // Get circle center point
+        center_pt := sketch_get_point(sketch, circle.center_id)
+        if center_pt == nil {
+            fmt.println("❌ Invalid circle center point")
+            sketch.first_line_id = -1
+            return
+        }
+
+        // Calculate diameter
+        diameter := circle.radius * 2.0
+
+        // Create diameter constraint
+        constraint_id := sketch_add_constraint(sketch, .Diameter, DiameterData{
+            circle_id = sketch.first_line_id,
+            diameter = diameter,
+            offset = click_pos,
+        })
+
+        fmt.printf("✅ Diameter dimension created: Ø%.3f for circle %d\n",
+            diameter, sketch.first_line_id)
+        fmt.printf("   Center: (%.3f, %.3f), Radius: %.3f\n",
+            center_pt.x, center_pt.y, circle.radius)
+        fmt.printf("   Placed at offset (%.3f, %.3f)\n", click_pos.x, click_pos.y)
+        fmt.printf("   Constraint ID: %d\n", constraint_id)
+
+        // Reset for next dimension (stay in Dimension tool)
+        sketch.first_line_id = -1
+        fmt.println("  → Ready for next dimension (or press ESC to finish)")
+        return
+    }
+
+    // ==========================================================================
     // CLICK 3b: DISTANCE MODE - Place dimension (SMART: horizontal/vertical/diagonal)
     // ==========================================================================
     if sketch.first_point_id >= 0 && sketch.second_point_id >= 0 {
@@ -644,13 +840,89 @@ handle_dimension_tool_click :: proc(sketch: ^Sketch2D, click_pos: m.Vec2) {
         dimension_name: string
 
         // CASE 1: Edge dimension (selected edge directly with first_line_id set)
-        // → Always use Distance (parallel to edge), don't snap to H/V
+        // → Detect if edge is H/V and use appropriate dimension type
         if sketch.first_line_id >= 0 {
-            // Edge dimension - always use diagonal distance (parallel to edge)
-            dimension_type = .Distance
-            dimension_value = glsl.length(p2 - p1)
-            dimension_name = "Distance"
-            fmt.println("📏 Edge dimension mode (parallel to edge)")
+            // Calculate edge angle to determine if it's horizontal or vertical
+            dx := p2.x - p1.x
+            dy := p2.y - p1.y
+            edge_length := glsl.length(edge_vec)
+
+            // Check if edge is horizontal or vertical (within tolerance)
+            ALIGNMENT_TOLERANCE :: 0.01  // Tolerance for detecting H/V alignment
+
+            if edge_length > 0.001 {
+                // Normalize to check alignment
+                norm_dx := glsl.abs(dx) / edge_length
+                norm_dy := glsl.abs(dy) / edge_length
+
+                if norm_dy < ALIGNMENT_TOLERANCE {
+                    // Edge is horizontal - check if it has a Horizontal constraint
+                    has_horizontal_constraint := false
+                    if entity, ok := sketch.entities[sketch.first_line_id].(SketchLine); ok {
+                        for c in sketch.constraints {
+                            if h_data, is_h := c.data.(HorizontalData); is_h {
+                                if h_data.line_id == sketch.first_line_id {
+                                    has_horizontal_constraint = true
+                                    break
+                                }
+                            }
+                        }
+                    }
+
+                    if has_horizontal_constraint {
+                        // Has Horizontal constraint → use simple Distance
+                        dimension_type = .Distance
+                        dimension_value = glsl.abs(dx)  // Unsigned distance
+                        dimension_name = "Distance"
+                        fmt.println("📏 Edge dimension mode (horizontal edge with H constraint → using Distance)")
+                    } else {
+                        // No Horizontal constraint → use DistanceX
+                        dimension_type = .DistanceX
+                        dimension_value = dx  // Signed horizontal distance
+                        dimension_name = "Horizontal"
+                        fmt.println("📏 Edge dimension mode (horizontal edge)")
+                    }
+                } else if norm_dx < ALIGNMENT_TOLERANCE {
+                    // Edge is vertical - check if it has a Vertical constraint
+                    has_vertical_constraint := false
+                    if entity, ok := sketch.entities[sketch.first_line_id].(SketchLine); ok {
+                        for c in sketch.constraints {
+                            if v_data, is_v := c.data.(VerticalData); is_v {
+                                if v_data.line_id == sketch.first_line_id {
+                                    has_vertical_constraint = true
+                                    break
+                                }
+                            }
+                        }
+                    }
+
+                    if has_vertical_constraint {
+                        // Has Vertical constraint → use simple Distance
+                        dimension_type = .Distance
+                        dimension_value = glsl.abs(dy)  // Unsigned distance
+                        dimension_name = "Distance"
+                        fmt.println("📏 Edge dimension mode (vertical edge with V constraint → using Distance)")
+                    } else {
+                        // No Vertical constraint → use DistanceY
+                        dimension_type = .DistanceY
+                        dimension_value = dy  // Signed vertical distance
+                        dimension_name = "Vertical"
+                        fmt.println("📏 Edge dimension mode (vertical edge)")
+                    }
+                } else {
+                    // Edge is angled - use regular Distance
+                    dimension_type = .Distance
+                    dimension_value = edge_length
+                    dimension_name = "Distance"
+                    fmt.println("📏 Edge dimension mode (angled edge)")
+                }
+            } else {
+                // Degenerate edge - fallback to Distance
+                dimension_type = .Distance
+                dimension_value = edge_length
+                dimension_name = "Distance"
+                fmt.println("📏 Edge dimension mode (parallel to edge)")
+            }
         } else {
             // CASE 2: Point-to-point dimension
             // → Smart detection based on cursor position
@@ -806,6 +1078,8 @@ sketch_start_drag_dimension :: proc(sketch: ^Sketch2D, constraint_id: int, start
         sketch.drag_offset_start = data.offset
     case AngleData:
         sketch.drag_offset_start = data.offset
+    case DiameterData:
+        sketch.drag_offset_start = data.offset
     case:
         // Other constraints don't support dragging
         sketch.dragging_constraint_id = -1
@@ -844,6 +1118,10 @@ sketch_update_drag_dimension :: proc(sketch: ^Sketch2D, current_pos: m.Vec2) {
 
     case AngleData:
         // Update offset to new position
+        data.offset = sketch.drag_offset_start + delta
+
+    case DiameterData:
+        // Update offset to new position (for diameter dimension leader line)
         data.offset = sketch.drag_offset_start + delta
     }
 }

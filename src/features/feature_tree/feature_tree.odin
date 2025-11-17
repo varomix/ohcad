@@ -8,6 +8,7 @@ import extrude "../../features/extrude"
 import cut "../../features/cut"
 import revolve "../../features/revolve"
 import m "../../core/math"
+import occt "../../core/geometry/occt"
 
 // Feature types
 FeatureType :: enum {
@@ -76,7 +77,8 @@ FeatureNode :: struct {
     parent_features: [dynamic]int,  // IDs of features this depends on
 
     // Result data
-    result_solid: ^extrude.SimpleSolid,  // Resulting 3D solid (if applicable)
+    occt_shape: occt.Shape,                  // NEW: Exact B-Rep geometry for boolean/fillet/chamfer operations
+    result_solid: ^extrude.SimpleSolid,      // Tessellated mesh for rendering
 
     // Metadata
     enabled: bool,                  // Is feature enabled?
@@ -118,7 +120,13 @@ feature_node_destroy :: proc(node: ^FeatureNode) {
     // Clean up dependencies array
     delete(node.parent_features)
 
-    // Clean up result data
+    // Clean up OCCT shape (exact geometry)
+    if node.occt_shape != nil {
+        occt.delete_shape(node.occt_shape)
+        node.occt_shape = nil
+    }
+
+    // Clean up result data (tessellated mesh)
     if node.result_solid != nil {
         result := extrude.ExtrudeResult{solid = node.result_solid}
         extrude.extrude_result_destroy(&result)
@@ -447,7 +455,13 @@ feature_regenerate_extrude :: proc(tree: ^FeatureTree, feature: ^FeatureNode) ->
         return false
     }
 
-    // Clean up old result
+    // Clean up old OCCT shape
+    if feature.occt_shape != nil {
+        occt.delete_shape(feature.occt_shape)
+        feature.occt_shape = nil
+    }
+
+    // Clean up old result solid
     if feature.result_solid != nil {
         old_result := extrude.ExtrudeResult{solid = feature.result_solid}
         extrude.extrude_result_destroy(&old_result)
@@ -468,8 +482,9 @@ feature_regenerate_extrude :: proc(tree: ^FeatureTree, feature: ^FeatureNode) ->
         return false
     }
 
-    // Store result
-    feature.result_solid = result.solid
+    // Store both exact geometry and tessellated mesh
+    feature.occt_shape = result.occt_shape    // Exact B-Rep result
+    feature.result_solid = result.solid        // Tessellated mesh for rendering
     feature.status = .Valid
 
     fmt.printf("✅ Extrude regenerated successfully\n")
@@ -516,18 +531,32 @@ feature_regenerate_cut :: proc(tree: ^FeatureTree, feature: ^FeatureNode) -> boo
         return false
     }
 
-    // Clean up old result
+    // Validate base feature has OCCT shape for exact boolean operations
+    if base_feature.occt_shape == nil {
+        fmt.printf("❌ Base feature %d has no OCCT shape (required for boolean operations)\n", params.base_feature_id)
+        feature.status = .Failed
+        return false
+    }
+
+    // Clean up old OCCT shape
+    if feature.occt_shape != nil {
+        occt.delete_shape(feature.occt_shape)
+        feature.occt_shape = nil
+    }
+
+    // Clean up old result solid
     if feature.result_solid != nil {
         old_result := cut.CutResult{solid = feature.result_solid}
         cut.cut_result_destroy(&old_result)
         feature.result_solid = nil
     }
 
-    // Perform cut
+    // Perform cut with OCCT boolean operations
     cut_params := cut.CutParams{
         depth = params.depth,
         direction = params.direction,
-        base_solid = base_feature.result_solid,
+        base_solid = base_feature.result_solid,  // For backward compatibility (will be deprecated)
+        base_shape = base_feature.occt_shape,     // NEW: Exact B-Rep geometry for boolean operations
     }
 
     result := cut.cut_sketch(sketch_params.sketch_ref, cut_params)
@@ -538,8 +567,9 @@ feature_regenerate_cut :: proc(tree: ^FeatureTree, feature: ^FeatureNode) -> boo
         return false
     }
 
-    // Store result
-    feature.result_solid = result.solid
+    // Store both exact geometry and tessellated mesh
+    feature.occt_shape = result.occt_shape    // Exact B-Rep result
+    feature.result_solid = result.solid        // Tessellated mesh for rendering
     feature.status = .Valid
 
     fmt.printf("✅ Cut regenerated successfully\n")

@@ -33,3 +33,16 @@ select nodes on the tree and enter edit mode
 example, sketches, extrude. etc.
 
 not solving when placing / editing dimensions
+
+
+- line tool, dimension while creating line
+- constraints while creating line
+- snapping while creating line
+- snapping while editing line
+- snapping while creating sketch
+- snapping while editing sketch
+
+make drag distance scale-addaptive (or screen pixels)
+make hover distance scale-addaptive (or screen pixels)
+make snapping distance scale-addaptive (or screen pixels)
+make snapping threshold scale-addaptive (or screen pixels)

@@ -81,13 +81,18 @@ unit_format :: proc(value: f64, unit: Unit, decimal_places: int = 2) -> string {
 
 // Document-level settings
 DocumentSettings :: struct {
-	units:          Unit, // Current unit system
-	decimal_places: int, // Number of decimal places for display
+	units:                    Unit, // Current unit system
+	decimal_places:           int, // Number of decimal places for display
+	show_units_on_dimensions: bool, // Show unit abbreviation on dimensions (e.g., "10.00 mm")
 }
 
 // Create default document settings
 document_settings_default :: proc() -> DocumentSettings {
-	return DocumentSettings{units = .Millimeters, decimal_places = 2}
+	return DocumentSettings {
+		units                    = .Millimeters,
+		decimal_places           = 2,
+		show_units_on_dimensions = false, // Don't show units on dimensions by default
+	}
 }
 
 // Set the unit system for the document
@@ -105,6 +110,23 @@ document_settings_set_decimal_places :: proc(settings: ^DocumentSettings, places
 document_format_value :: proc(settings: ^DocumentSettings, value: f64) -> string {
 	display_value := unit_from_internal(value, settings.units)
 	return unit_format(display_value, settings.units, settings.decimal_places)
+}
+
+// Format a value according to document settings (optionally with units)
+document_format_value_conditional :: proc(
+	settings: ^DocumentSettings,
+	value: f64,
+	show_units: bool,
+) -> string {
+	display_value := unit_from_internal(value, settings.units)
+
+	if show_units {
+		return unit_format(display_value, settings.units, settings.decimal_places)
+	} else {
+		// Format without units
+		format_str := fmt.tprintf("%%.%df", settings.decimal_places)
+		return fmt.tprintf(format_str, display_value)
+	}
 }
 
 // Parse a value from user input (returns value in internal units)

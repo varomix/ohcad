@@ -446,6 +446,10 @@ UIContext :: struct {
     feature_tree_click_id: int,  // ID of feature clicked in tree (-1 if none)
     checkmark_clicked: bool,     // True if checkmark button was clicked (finish editing)
 
+    // Solid toolbar interaction
+    selected_sketch_plane: int,  // 0 = none, 1 = XY, 2 = YZ, 3 = XZ
+    clicked_primitive_id: int,   // 0 = none, 5 = Box, 6 = Cylinder, 7 = Sphere, 8 = Cone, 9 = Torus
+
     // Style
     style: UIStyle,
 }

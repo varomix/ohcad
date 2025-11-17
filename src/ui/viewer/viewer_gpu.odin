@@ -63,7 +63,8 @@ ViewerGPU :: struct {
     vertex_shader: ^sdl.GPUShader,
     fragment_shader: ^sdl.GPUShader,
     pipeline: ^sdl.GPUGraphicsPipeline,       // For line rendering
-    triangle_pipeline: ^sdl.GPUGraphicsPipeline,  // For thick line rendering (quads)
+    triangle_pipeline: ^sdl.GPUGraphicsPipeline,  // For thick line rendering (quads) - no depth test for UI
+    wireframe_pipeline: ^sdl.GPUGraphicsPipeline,  // For wireframe overlay - with depth testing
 
     // Shaded rendering pipeline (with lighting)
     triangle_vertex_shader: ^sdl.GPUShader,
@@ -539,6 +540,20 @@ text_renderer_gpu_init :: proc(gpu_device: ^sdl.GPUDevice, window: ^sdl.Window, 
 
     renderer.text_pipeline = text_pipeline
 
+    // Pre-warm the font atlas with common characters
+    // This prevents glyphs from missing on first render
+    fs.SetFont(&renderer.font_context, font_id)
+    fs.SetSize(&renderer.font_context, 28.0)
+
+    // Pre-render common ASCII characters to populate atlas
+    prewarm_text := " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    iter := fs.TextIterInit(&renderer.font_context, 0, 0, prewarm_text)
+    quad: fs.Quad
+    for fs.TextIterNext(&renderer.font_context, &iter, &quad) {
+        // Just iterate to force glyph rasterization
+    }
+
+    fmt.println("✓ Font atlas pre-warmed with common characters")
     fmt.println("✓ Text renderer initialized successfully")
     return renderer, true
 }
@@ -623,10 +638,6 @@ text_render_2d_gpu :: proc(
     }
 
     if vertex_count == 0 do return
-
-    // ALWAYS upload texture before rendering text (ensures latest glyphs are on GPU)
-    // Fontstash may add new glyphs to the atlas dynamically - this is normal!
-    text_renderer_gpu_update_texture(renderer)
 
     // Create temporary vertex buffer for text
     buffer_info := sdl.GPUBufferCreateInfo{
@@ -939,6 +950,22 @@ sketch_to_wireframe_selected_gpu :: proc(sk: ^sketch.Sketch2D) -> WireframeMeshG
 // =============================================================================
 
 // Render sketch points as filled circular dots with screen-space constant size
+// Calculate world-space size of one pixel at the sketch plane
+// This accounts for both perspective and orthographic projection
+get_pixel_size_world :: proc(viewer: ^ViewerGPU) -> f32 {
+    viewport_height := f32(viewer.window_height)
+    viewport_width := f32(viewer.window_width)
+
+    if viewer.camera.projection_mode == .Orthographic {
+        // Orthographic: pixel size is simply ortho_width divided by viewport width
+        return viewer.camera.ortho_width / viewport_width
+    } else {
+        // Perspective: pixel size depends on distance and FOV
+        fov_radians := math.to_radians(viewer.camera.fov)
+        return (2.0 * viewer.camera.distance * math.tan(fov_radians * 0.5)) / viewport_height
+    }
+}
+
 viewer_gpu_render_sketch_points :: proc(
     viewer: ^ViewerGPU,
     cmd: ^sdl.GPUCommandBuffer,
@@ -951,9 +978,7 @@ viewer_gpu_render_sketch_points :: proc(
     if len(sk.points) == 0 do return
 
     // Calculate screen-space to world-space conversion
-    viewport_height := f32(viewer.window_height)
-    fov_radians := math.to_radians(viewer.camera.fov)
-    pixel_size_world := (2.0 * viewer.camera.distance * math.tan(fov_radians * 0.5)) / viewport_height
+    pixel_size_world := get_pixel_size_world(viewer)
 
     // Calculate radius in world units for the desired pixel size
     radius := pixel_size_world * point_size_pixels
@@ -1093,9 +1118,7 @@ viewer_gpu_render_single_point :: proc(
     point_size_pixels: f32,
 ) {
     // Calculate screen-space to world-space conversion
-    viewport_height := f32(viewer.window_height)
-    fov_radians := math.to_radians(viewer.camera.fov)
-    pixel_size_world := (2.0 * viewer.camera.distance * math.tan(fov_radians * 0.5)) / viewport_height
+    pixel_size_world := get_pixel_size_world(viewer)
 
     // Calculate radius in world units for the desired pixel size
     radius := pixel_size_world * point_size_pixels
@@ -1259,8 +1282,11 @@ viewer_gpu_render_sketch_preview :: proc(
     viewer: ^ViewerGPU,
     cmd: ^sdl.GPUCommandBuffer,
     pass: ^sdl.GPURenderPass,
+    text_renderer: ^TextRendererGPU,
     sk: ^sketch.Sketch2D,
     mvp: matrix[4,4]f32,
+    view: matrix[4,4]f32,
+    proj: matrix[4,4]f32,
 ) {
     if !sk.temp_point_valid do return
 
@@ -1292,14 +1318,102 @@ viewer_gpu_render_sketch_preview :: proc(
         if first_pt != nil {
             start_2d := m.Vec2{first_pt.x, first_pt.y}
             start_3d := sketch.sketch_to_world(&sk.plane, start_2d)
+            end_2d := sk.temp_point
+
+            // Calculate line vector and length
+            line_vec := end_2d - start_2d
+            line_length := glsl.length(line_vec)
+
+            // Horizontal/Vertical constraint snap detection
+            SNAP_ANGLE_THRESHOLD :: 5.0  // degrees
+            is_horizontal := false
+            is_vertical := false
+            snapped_end_2d := end_2d
+
+            if line_length > 0.001 {
+                // Calculate angle from horizontal
+                angle_rad := math.atan2(line_vec.y, line_vec.x)
+                angle_deg := angle_rad * 180.0 / math.PI
+
+                // Normalize angle to 0-360
+                if angle_deg < 0 do angle_deg += 360.0
+
+                // DEBUG: Print angle and line vector for debugging constraint orientation
+                // fmt.printf("DEBUG: Line angle=%.1f°, vec=(%.3f, %.3f), len=%.3f\n",
+                    // angle_deg, line_vec.x, line_vec.y, line_length)
+
+                // Check for horizontal snap (0° or 180°)
+                if glsl.abs(angle_deg) < SNAP_ANGLE_THRESHOLD ||
+                   glsl.abs(angle_deg - 180.0) < SNAP_ANGLE_THRESHOLD ||
+                   glsl.abs(angle_deg - 360.0) < SNAP_ANGLE_THRESHOLD {
+                    is_horizontal = true
+                    // Snap Y coordinate to match start point
+                    snapped_end_2d.y = start_2d.y
+                    // fmt.println("DEBUG: Detected HORIZONTAL line (angle near 0°/180°)")
+                } else if glsl.abs(angle_deg - 90.0) < SNAP_ANGLE_THRESHOLD ||
+                          glsl.abs(angle_deg - 270.0) < SNAP_ANGLE_THRESHOLD {
+                    // Check for vertical snap (90° or 270°)
+                    is_vertical = true
+                    // Snap X coordinate to match start point
+                    snapped_end_2d.x = start_2d.x
+                    // fmt.println("DEBUG: Detected VERTICAL line (angle near 90°/270°)")
+                }
+            }
+
+            // Update sketch snap state for constraint application
+            sk.preview_snap_horizontal = is_horizontal
+            sk.preview_snap_vertical = is_vertical
+
+            // Use snapped position for rendering if snapped
+            cursor_3d_snapped := cursor_3d
+            if is_horizontal || is_vertical {
+                cursor_3d_snapped = sketch.sketch_to_world(&sk.plane, snapped_end_2d)
+            }
 
             preview_line := [][2][3]f32{
                 {
                     {f32(start_3d.x), f32(start_3d.y), f32(start_3d.z)},
-                    {f32(cursor_3d.x), f32(cursor_3d.y), f32(cursor_3d.z)},
+                    {f32(cursor_3d_snapped.x), f32(cursor_3d_snapped.y), f32(cursor_3d_snapped.z)},
                 },
             }
-            viewer_gpu_render_thick_lines(viewer, cmd, pass, preview_line, {0, 1, 1, 0.7}, mvp, 1.2)
+
+            // Draw preview line with different color if snapped
+            line_color := is_horizontal || is_vertical ? [4]f32{1.0, 0.5, 0.0, 0.9} : [4]f32{0, 1, 1, 0.7}
+            viewer_gpu_render_thick_lines(viewer, cmd, pass, preview_line, line_color, mvp, 1.2)
+
+            // Display dimension text next to the preview line
+            if text_renderer != nil {
+                // Calculate actual line length (using snapped position if applicable)
+                actual_end_2d := is_horizontal || is_vertical ? snapped_end_2d : end_2d
+                actual_length := glsl.length(actual_end_2d - start_2d)
+
+                // Calculate midpoint for text placement
+                mid_3d := (start_3d + cursor_3d_snapped) * 0.5
+                clip_pos := proj * view * glsl.vec4{f32(mid_3d.x), f32(mid_3d.y), f32(mid_3d.z), 1.0}
+
+                if clip_pos.w != 0.0 {
+                    ndc := clip_pos.xyz / clip_pos.w
+                    screen_x := (ndc.x + 1.0) * 0.5 * f32(viewer.window_width)
+                    screen_y := (1.0 - ndc.y) * 0.5 * f32(viewer.window_height)
+
+                    // Display dimension text
+                    dim_text := fmt.tprintf("%.2f", actual_length)
+                    text_size: f32 = 14
+                    text_offset: f32 = 15  // Offset text above the line
+
+                    text_color := is_horizontal || is_vertical ? [4]u8{255, 128, 0, 255} : [4]u8{0, 255, 255, 255}
+                    text_render_2d_gpu(text_renderer, cmd, pass, dim_text, screen_x, screen_y - text_offset, text_size, text_color, viewer.window_width, viewer.window_height)
+
+                    // Display constraint indicator (H or V)
+                    if is_horizontal {
+                        constraint_text := "H"
+                        text_render_2d_gpu(text_renderer, cmd, pass, constraint_text, screen_x + 30, screen_y - text_offset, text_size, [4]u8{255, 128, 0, 255}, viewer.window_width, viewer.window_height)
+                    } else if is_vertical {
+                        constraint_text := "V"
+                        text_render_2d_gpu(text_renderer, cmd, pass, constraint_text, screen_x + 30, screen_y - text_offset, text_size, [4]u8{255, 128, 0, 255}, viewer.window_width, viewer.window_height)
+                    }
+                }
+            }
 
             // Visual feedback for auto-close: Highlight chain start point in yellow if cursor is near it
             AUTO_CLOSE_THRESHOLD :: 0.15
@@ -1698,6 +1812,79 @@ viewer_gpu_render_sketch_preview :: proc(
         }
     }
 
+    // DIAMETER DIMENSION PREVIEW: If dimension tool has a circle selected, draw preview diameter
+    if sk.current_tool == .Dimension && sk.first_line_id >= 0 &&
+       sk.first_point_id == -1 && sk.second_point_id == -1 && sk.second_line_id == -1 {
+
+        // Verify the entity is a circle
+        if sk.first_line_id < len(sk.entities) {
+            entity := sk.entities[sk.first_line_id]
+            if circle, is_circle := entity.(sketch.SketchCircle); is_circle {
+                // Get circle center point
+                center_pt := sketch.sketch_get_point(sk, circle.center_id)
+                if center_pt != nil {
+                    center_2d := m.Vec2{center_pt.x, center_pt.y}
+
+                    // Calculate diameter line direction from center to cursor
+                    offset_vec := sk.temp_point - center_2d
+                    offset_len := glsl.length(offset_vec)
+
+                    // Default to horizontal if cursor is at center
+                    dim_dir: m.Vec2
+                    if offset_len < 1e-10 {
+                        dim_dir = m.Vec2{1, 0}
+                    } else {
+                        dim_dir = offset_vec / offset_len
+                    }
+
+                    // Calculate two points on circle edge along diameter line
+                    edge1_2d := center_2d - dim_dir * circle.radius
+                    edge2_2d := center_2d + dim_dir * circle.radius
+
+                    // Convert to 3D
+                    edge1_3d := sketch.sketch_to_world(&sk.plane, edge1_2d)
+                    edge2_3d := sketch.sketch_to_world(&sk.plane, edge2_2d)
+
+                    // Dimension line
+                    preview_lines := make([dynamic][2][3]f32, context.temp_allocator)
+                    append(&preview_lines, [2][3]f32{
+                        {f32(edge1_3d.x), f32(edge1_3d.y), f32(edge1_3d.z)},
+                        {f32(edge2_3d.x), f32(edge2_3d.y), f32(edge2_3d.z)},
+                    })
+
+                    // Arrows at both ends
+                    arrow_lines := render_dimension_arrow_heads(sk, edge1_2d, edge2_2d, dim_dir, 0.15, 30.0)
+                    for arrow_line in arrow_lines {
+                        append(&preview_lines, arrow_line)
+                    }
+
+                    // Draw preview dimension in bright yellow (semi-transparent)
+                    viewer_gpu_render_thick_lines(viewer, cmd, pass, preview_lines[:], {1.0, 1.0, 0.0, 0.7}, mvp, 1.5)
+
+                    // Display diameter text next to cursor
+                    if text_renderer != nil {
+                        diameter := circle.radius * 2.0
+                        cursor_3d := sketch.sketch_to_world(&sk.plane, sk.temp_point)
+                        clip_pos := proj * view * glsl.vec4{f32(cursor_3d.x), f32(cursor_3d.y), f32(cursor_3d.z), 1.0}
+
+                        if clip_pos.w != 0.0 {
+                            ndc := clip_pos.xyz / clip_pos.w
+                            screen_x := (ndc.x + 1.0) * 0.5 * f32(viewer.window_width)
+                            screen_y := (1.0 - ndc.y) * 0.5 * f32(viewer.window_height)
+
+                            // Display dimension text with Ø symbol
+                            dia_text := fmt.tprintf("Ø%.2f", diameter)
+                            text_size: f32 = 14
+                            text_offset: f32 = 15
+
+                            text_render_2d_gpu(text_renderer, cmd, pass, dia_text, screen_x + text_offset, screen_y - text_offset, text_size, [4]u8{255, 255, 0, 255}, viewer.window_width, viewer.window_height)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // If circle tool has center point, draw preview circle
     if sk.current_tool == .Circle && sk.first_point_id != -1 {
         center_pt := sketch.sketch_get_point(sk, sk.first_point_id)
@@ -1793,6 +1980,9 @@ viewer_gpu_render_sketch_constraints :: proc(
 
         case sketch.DistanceYData:
             render_distance_y_dimension_gpu(viewer, cmd, pass, text_renderer, sk, data, mvp, view, proj, is_selected, document_settings)
+
+        case sketch.DiameterData:
+            render_diameter_dimension_gpu(viewer, cmd, pass, text_renderer, sk, data, mvp, view, proj, is_selected, document_settings)
 
         case sketch.PerpendicularData, sketch.ParallelData, sketch.CoincidentData, sketch.EqualData:
             // These constraint types can be added later if needed
@@ -1890,16 +2080,14 @@ render_distance_dimension_gpu :: proc(
         // Format distance value with units if document_settings provided
         dist_text: string
         if document_settings != nil {
-            dist_text = doc.document_format_value(document_settings, math.abs(data.distance))
+            dist_text = doc.document_format_value_conditional(document_settings, math.abs(data.distance), document_settings.show_units_on_dimensions)
         } else {
             dist_text = fmt.tprintf("%.2f", math.abs(data.distance))
         }
         text_width_pixels, text_height_pixels = text_measure_gpu(text_renderer, dist_text, text_size)
 
         // Convert text width from screen pixels to world units
-        viewport_height := f32(viewer.window_height)
-        fov_radians := math.to_radians(viewer.camera.fov)
-        pixel_size_world := f64((2.0 * viewer.camera.distance * math.tan(fov_radians * 0.5)) / viewport_height)
+        pixel_size_world := f64(get_pixel_size_world(viewer))
 
         // Add padding (40% on each side for breathing room)
         text_width_world = f64(text_width_pixels) * pixel_size_world * 1.8
@@ -1907,30 +2095,44 @@ render_distance_dimension_gpu :: proc(
 
     // Calculate gap positions (centered on midpoint)
     gap_half := text_width_world * 0.5
-    gap_start_2d := mid + perp_dir * offset_distance - dim_dir * gap_half
-    gap_end_2d := mid + perp_dir * offset_distance + dim_dir * gap_half
+    dim_mid_2d := (dim1_2d + dim2_2d) * 0.5  // Midpoint of dimension line
+    gap_start_2d := dim_mid_2d - dim_dir * gap_half
+    gap_end_2d := dim_mid_2d + dim_dir * gap_half
 
-    // Dimension line with gap (split into two segments)
-    // Left segment: dim1 to gap_start
-    if glsl.length(gap_start_2d - dim1_2d) > 0.01 {
+    // Calculate dimension line length to check if gap fits
+    dim_line_len := glsl.length(dim2_2d - dim1_2d)
+    gap_total_width := text_width_world
+
+    // Only draw gap if it fits within the dimension line
+    if gap_total_width < dim_line_len - 0.02 {
+        // Gap fits - draw dimension line with gap (split into two segments)
+
+        // Left segment: dim1 to gap_start
         gap_start_3d := sketch.sketch_to_world(&sk.plane, gap_start_2d)
         append(&dim_lines, [2][3]f32{
             {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
             {f32(gap_start_3d.x), f32(gap_start_3d.y), f32(gap_start_3d.z)},
         })
-    }
 
-    // Right segment: gap_end to dim2
-    if glsl.length(dim2_2d - gap_end_2d) > 0.01 {
+        // Right segment: gap_end to dim2
         gap_end_3d := sketch.sketch_to_world(&sk.plane, gap_end_2d)
         append(&dim_lines, [2][3]f32{
             {f32(gap_end_3d.x), f32(gap_end_3d.y), f32(gap_end_3d.z)},
             {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
         })
+    } else {
+        // Gap too wide - draw full line without gap (text will overlap, but dimension is still visible)
+        append(&dim_lines, [2][3]f32{
+            {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
+            {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+        })
     }
 
-    // Arrow head size in world units
-    ARROW_SIZE :: 0.15
+    // Arrow head size - scale with camera distance for consistent screen size
+    // At distance 100 (default for mm), arrow is 1.5mm. Scales linearly with zoom.
+    camera_distance := glsl.length(viewer.camera.position - viewer.camera.target)
+    ARROW_BASE_SIZE :: 1.5  // Base size in mm at default camera distance
+    arrow_size := ARROW_BASE_SIZE * (camera_distance / 100.0)  // Scale with camera distance
     ARROW_ANGLE :: 30.0 // degrees
 
     // Draw arrow heads at both ends
@@ -1939,7 +2141,7 @@ render_distance_dimension_gpu :: proc(
         dim1_2d,
         dim2_2d,
         dim_dir,
-        ARROW_SIZE,
+        arrow_size,
         ARROW_ANGLE,
     )
 
@@ -1969,7 +2171,7 @@ render_distance_dimension_gpu :: proc(
             // Format distance value with units if document_settings provided
             dist_text: string
             if document_settings != nil {
-                dist_text = doc.document_format_value(document_settings, math.abs(data.distance))
+                dist_text = doc.document_format_value_conditional(document_settings, math.abs(data.distance), document_settings.show_units_on_dimensions)
             } else {
                 dist_text = fmt.tprintf("%.2f", math.abs(data.distance))
             }
@@ -1989,6 +2191,175 @@ render_distance_dimension_gpu :: proc(
                 screen_x - text_offset_x,  // Center horizontally
                 screen_y - text_offset_y,  // Center vertically
                 text_size,                 // Use larger text size
+                text_color,
+                viewer.window_width,
+                viewer.window_height,
+            )
+        }
+    }
+}
+
+// Render diameter dimension for circles
+render_diameter_dimension_gpu :: proc(
+    viewer: ^ViewerGPU,
+    cmd: ^sdl.GPUCommandBuffer,
+    pass: ^sdl.GPURenderPass,
+    text_renderer: ^TextRendererGPU,
+    sk: ^sketch.Sketch2D,
+    data: sketch.DiameterData,
+    mvp: matrix[4,4]f32,
+    view: matrix[4,4]f32,
+    proj: matrix[4,4]f32,
+    is_selected: bool,
+    document_settings: ^doc.DocumentSettings = nil,
+) {
+    // Get circle entity
+    if data.circle_id < 0 || data.circle_id >= len(sk.entities) do return
+
+    entity := sk.entities[data.circle_id]
+    circle, ok := entity.(sketch.SketchCircle)
+    if !ok do return
+
+    // Get center point
+    center_pt := sketch.sketch_get_point(sk, circle.center_id)
+    if center_pt == nil do return
+
+    center_2d := m.Vec2{center_pt.x, center_pt.y}
+
+    // Calculate diameter line direction from center to offset position
+    // This determines which diameter line to show (user can click different sides of circle)
+    offset_vec := data.offset - center_2d
+    offset_len := glsl.length(offset_vec)
+
+    // Default to horizontal if offset is at center (shouldn't happen, but safe fallback)
+    dim_dir: m.Vec2
+    if offset_len < 1e-10 {
+        dim_dir = m.Vec2{1, 0}  // Horizontal fallback
+    } else {
+        dim_dir = offset_vec / offset_len
+    }
+
+    // Calculate two points on circle edge along diameter line
+    edge1_2d := center_2d - dim_dir * circle.radius
+    edge2_2d := center_2d + dim_dir * circle.radius
+
+    // Convert to 3D world space
+    edge1_3d := sketch.sketch_to_world(&sk.plane, edge1_2d)
+    edge2_3d := sketch.sketch_to_world(&sk.plane, edge2_2d)
+    center_3d := sketch.sketch_to_world(&sk.plane, center_2d)
+
+    // Build dimension lines
+    dim_lines := make([dynamic][2][3]f32, context.temp_allocator)
+
+    // Calculate text width to create gap
+    text_size: f32 = 20
+    text_width_world: f64 = 0.5
+    text_width_pixels: f32 = 0
+    text_height_pixels: f32 = 0
+
+    if text_renderer != nil {
+        // Format diameter value with Ø symbol and units
+        dia_text: string
+        if document_settings != nil {
+            value_text := doc.document_format_value_conditional(document_settings, data.diameter, document_settings.show_units_on_dimensions)
+            dia_text = fmt.tprintf("Ø%s", value_text)
+        } else {
+            dia_text = fmt.tprintf("Ø%.2f", data.diameter)
+        }
+        text_width_pixels, text_height_pixels = text_measure_gpu(text_renderer, dia_text, text_size)
+
+        // Convert text width from screen pixels to world units
+        pixel_size_world := f64(get_pixel_size_world(viewer))
+
+        // Add padding (40% on each side)
+        text_width_world = f64(text_width_pixels) * pixel_size_world * 1.8
+    }
+
+    // Calculate gap positions (centered on circle center)
+    gap_half := text_width_world * 0.5
+    gap_start_2d := center_2d - dim_dir * gap_half
+    gap_end_2d := center_2d + dim_dir * gap_half
+
+    // Diameter line is always at least as long as the diameter, so gap always fits
+    // Draw dimension line with gap (split into two segments)
+
+    // Left segment: edge1 to gap_start
+    gap_start_3d := sketch.sketch_to_world(&sk.plane, gap_start_2d)
+    append(&dim_lines, [2][3]f32{
+        {f32(edge1_3d.x), f32(edge1_3d.y), f32(edge1_3d.z)},
+        {f32(gap_start_3d.x), f32(gap_start_3d.y), f32(gap_start_3d.z)},
+    })
+
+    // Right segment: gap_end to edge2
+    gap_end_3d := sketch.sketch_to_world(&sk.plane, gap_end_2d)
+    append(&dim_lines, [2][3]f32{
+        {f32(gap_end_3d.x), f32(gap_end_3d.y), f32(gap_end_3d.z)},
+        {f32(edge2_3d.x), f32(edge2_3d.y), f32(edge2_3d.z)},
+    })
+
+    // Arrow head size - scale with camera distance
+    camera_distance := glsl.length(viewer.camera.position - viewer.camera.target)
+    ARROW_BASE_SIZE :: 1.5
+    arrow_size := ARROW_BASE_SIZE * (camera_distance / 100.0)
+    ARROW_ANGLE :: 30.0
+
+    // Draw arrow heads at both ends (pointing outward from center)
+    arrow_lines := render_dimension_arrow_heads(
+        sk,
+        edge1_2d,
+        edge2_2d,
+        dim_dir,
+        arrow_size,
+        ARROW_ANGLE,
+    )
+
+    // Combine dimension lines and arrow lines
+    for arrow_line in arrow_lines {
+        append(&dim_lines, arrow_line)
+    }
+
+    // Draw dimension lines in bright yellow (or white if selected)
+    dim_color := is_selected ? [4]f32{1.0, 1.0, 1.0, 1.0} : [4]f32{1.0, 1.0, 0.0, 1.0}
+    viewer_gpu_render_thick_lines(viewer, cmd, pass, dim_lines[:], dim_color, mvp, 1.5)
+
+    // Render diameter text with Ø symbol
+    if text_renderer != nil {
+        // Project center to screen space
+        clip_pos := proj * view * glsl.vec4{f32(center_3d.x), f32(center_3d.y), f32(center_3d.z), 1.0}
+
+        if clip_pos.w != 0.0 {
+            // Convert from clip space to screen space
+            ndc := clip_pos.xyz / clip_pos.w
+            screen_x := (ndc.x + 1.0) * 0.5 * f32(viewer.window_width)
+            screen_y := (1.0 - ndc.y) * 0.5 * f32(viewer.window_height)
+
+            // Format diameter value with Ø symbol and units
+            dia_text: string
+            if document_settings != nil {
+                value_text := doc.document_format_value_conditional(document_settings, data.diameter, document_settings.show_units_on_dimensions)
+                dia_text = fmt.tprintf("Ø%s", value_text)
+            } else {
+                dia_text = fmt.tprintf("Ø%.2f", data.diameter)
+            }
+
+            // Center the text horizontally
+            text_offset_x := text_width_pixels * 0.5
+            text_offset_y := text_height_pixels * 0.5
+
+            // Position text ABOVE the diameter line (like reference image)
+            // Move upward by 1.2x text height from center to position above the line
+            text_vertical_offset := text_height_pixels * 1.2
+
+            // Render text above the diameter line (bright yellow if not selected, white if selected)
+            text_color := is_selected ? [4]u8{255, 255, 255, 255} : [4]u8{255, 255, 0, 255}
+            text_render_2d_gpu(
+                text_renderer,
+                cmd,
+                pass,
+                dia_text,
+                screen_x - text_offset_x,
+                screen_y - text_offset_y - text_vertical_offset,  // Move upward in screen space
+                text_size,
                 text_color,
                 viewer.window_width,
                 viewer.window_height,
@@ -2098,9 +2469,28 @@ render_horizontal_icon_gpu :: proc(
 
     mid_2d := m.Vec2{(p1.x + p2.x) * 0.5, (p1.y + p2.y) * 0.5}
 
-    // Offset upward
-    size := 0.15
-    offset_2d := m.Vec2{mid_2d.x, mid_2d.y + size * 1.5}
+    // SCREEN-SPACE CONSTANT SIZE: Calculate icon size based on screen pixels
+    pixel_size_world := get_pixel_size_world(viewer)
+    icon_size_pixels: f32 = 24  // Icon size in pixels (was 0.15 world units)
+    offset_pixels: f32 = 40     // Offset from line in pixels (was 1.5 * size)
+
+    size := f64(pixel_size_world * icon_size_pixels)
+    offset_distance := f64(pixel_size_world * offset_pixels)
+
+    // Calculate line direction in sketch space
+    line_dir := m.Vec2{p2.x - p1.x, p2.y - p1.y}
+    line_len := glsl.length(line_dir)
+
+    // Offset perpendicular to the line (horizontal line is parallel to X, so offset in Y)
+    // For horizontal constraint: line is parallel to X axis (dy=0), so perpendicular is (0,1)
+    perpendicular := m.Vec2{0, 1}
+    if line_len > 0.001 {
+        line_dir = line_dir / line_len
+        // Perpendicular vector (rotate 90° CCW): (x,y) → (-y,x)
+        perpendicular = m.Vec2{-line_dir.y, line_dir.x}
+    }
+
+    offset_2d := mid_2d + perpendicular * offset_distance
 
     // Draw 'H' shape
     h_lines := make([dynamic][2][3]f32, context.temp_allocator)
@@ -2164,9 +2554,28 @@ render_vertical_icon_gpu :: proc(
 
     mid_2d := m.Vec2{(p1.x + p2.x) * 0.5, (p1.y + p2.y) * 0.5}
 
-    // Offset to the side
-    size := 0.15
-    offset_2d := m.Vec2{mid_2d.x + size * 1.5, mid_2d.y}
+    // SCREEN-SPACE CONSTANT SIZE: Calculate icon size based on screen pixels
+    pixel_size_world := get_pixel_size_world(viewer)
+    icon_size_pixels: f32 = 24  // Icon size in pixels (was 0.15 world units)
+    offset_pixels: f32 = 40     // Offset from line in pixels (was 1.5 * size)
+
+    size := f64(pixel_size_world * icon_size_pixels)
+    offset_distance := f64(pixel_size_world * offset_pixels)
+
+    // Calculate line direction in sketch space
+    line_dir := m.Vec2{p2.x - p1.x, p2.y - p1.y}
+    line_len := glsl.length(line_dir)
+
+    // Offset perpendicular to the line (vertical line is parallel to Y, so offset in X)
+    // For vertical constraint: line is parallel to Y axis (dx=0), so perpendicular is (1,0)
+    perpendicular := m.Vec2{1, 0}
+    if line_len > 0.001 {
+        line_dir = line_dir / line_len
+        // Perpendicular vector (rotate 90° CCW): (x,y) → (-y,x)
+        perpendicular = m.Vec2{-line_dir.y, line_dir.x}
+    }
+
+    offset_2d := mid_2d + perpendicular * offset_distance
 
     // Draw 'V' shape
     v_lines := make([dynamic][2][3]f32, context.temp_allocator)
@@ -2269,10 +2678,8 @@ render_distance_x_dimension_gpu :: proc(
         dist_text := fmt.tprintf("%.2f", math.abs(data.distance))
         text_width_pixels, text_height_pixels = text_measure_gpu(text_renderer, dist_text, text_size)
 
-        viewport_height := f32(viewer.window_height)
-        fov_radians := math.to_radians(viewer.camera.fov)
-        pixel_size_world := f64((2.0 * viewer.camera.distance * math.tan(fov_radians * 0.5)) / viewport_height)
-        text_width_world = f64(text_width_pixels) * pixel_size_world * 1.8
+        pixel_size_world := f64(get_pixel_size_world(viewer))
+        text_width_world = f64(text_width_pixels) * pixel_size_world * 2.2  // Increased padding for gap
     }
 
     // Calculate gap positions (centered on X midpoint)
@@ -2281,19 +2688,28 @@ render_distance_x_dimension_gpu :: proc(
     gap_start_2d := m.Vec2{mid_x - gap_half, dim_y}
     gap_end_2d := m.Vec2{mid_x + gap_half, dim_y}
 
-    // Dimension line with gap (split into two segments)
-    if glsl.abs(gap_start_2d.x - dim1_2d.x) > 0.01 {
+    // Calculate dimension line length to check if gap fits
+    dim_line_len := glsl.abs(dim2_2d.x - dim1_2d.x)
+    gap_total_width := text_width_world
+
+    // Only draw gap if it fits within the dimension line
+    if gap_total_width < dim_line_len - 0.02 {
+        // Gap fits - draw dimension line with gap (split into two segments)
         gap_start_3d := sketch.sketch_to_world(&sk.plane, gap_start_2d)
         append(&dim_lines, [2][3]f32{
             {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
             {f32(gap_start_3d.x), f32(gap_start_3d.y), f32(gap_start_3d.z)},
         })
-    }
 
-    if glsl.abs(dim2_2d.x - gap_end_2d.x) > 0.01 {
         gap_end_3d := sketch.sketch_to_world(&sk.plane, gap_end_2d)
         append(&dim_lines, [2][3]f32{
             {f32(gap_end_3d.x), f32(gap_end_3d.y), f32(gap_end_3d.z)},
+            {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+        })
+    } else {
+        // Gap too wide - draw full line without gap
+        append(&dim_lines, [2][3]f32{
+            {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
             {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
         })
     }
@@ -2307,10 +2723,13 @@ render_distance_x_dimension_gpu :: proc(
         dim_dir = dim_vec / dim_len
     }
 
-    ARROW_SIZE :: 0.15
+    // Arrow head size - scale with camera distance for consistent screen size
+    camera_distance := glsl.length(viewer.camera.position - viewer.camera.target)
+    ARROW_BASE_SIZE :: 1.5  // Base size in mm
+    arrow_size := ARROW_BASE_SIZE * (camera_distance / 100.0)
     ARROW_ANGLE :: 30.0
 
-    arrow_lines := render_dimension_arrow_heads(sk, dim1_2d, dim2_2d, dim_dir, ARROW_SIZE, ARROW_ANGLE)
+    arrow_lines := render_dimension_arrow_heads(sk, dim1_2d, dim2_2d, dim_dir, arrow_size, ARROW_ANGLE)
     for arrow_line in arrow_lines {
         append(&dim_lines, arrow_line)
     }
@@ -2403,9 +2822,9 @@ render_distance_y_dimension_gpu :: proc(
         {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
     })
 
-    // Calculate text width for gap
+    // Calculate text dimensions for gap
     text_size: f32 = 20
-    text_width_world: f64 = 0.5
+    text_gap_world: f64 = 0.5  // Default gap size
     text_width_pixels: f32 = 0
     text_height_pixels: f32 = 0
 
@@ -2413,31 +2832,42 @@ render_distance_y_dimension_gpu :: proc(
         dist_text := fmt.tprintf("%.2f", math.abs(data.distance))
         text_width_pixels, text_height_pixels = text_measure_gpu(text_renderer, dist_text, text_size)
 
-        viewport_height := f32(viewer.window_height)
-        fov_radians := math.to_radians(viewer.camera.fov)
-        pixel_size_world := f64((2.0 * viewer.camera.distance * math.tan(fov_radians * 0.5)) / viewport_height)
-        text_width_world = f64(text_width_pixels) * pixel_size_world * 1.8
+        pixel_size_world := f64(get_pixel_size_world(viewer))
+
+        // For vertical dimensions, the gap along Y-axis must account for text WIDTH
+        // (text is horizontal but placed along a vertical line, so its width spans the Y gap)
+        // Use larger multiplier (4.0) to ensure arrows don't overlap with horizontal text
+        text_gap_world = f64(text_width_pixels) * pixel_size_world * 4.0
     }
 
     // Calculate gap positions (centered on Y midpoint)
     mid_y := (p1.y + p2.y) * 0.5
-    gap_half := text_width_world * 0.5
+    gap_half := text_gap_world * 0.5
     gap_start_2d := m.Vec2{dim_x, mid_y - gap_half}
     gap_end_2d := m.Vec2{dim_x, mid_y + gap_half}
 
-    // Dimension line with gap (split into two segments)
-    if glsl.abs(gap_start_2d.y - dim1_2d.y) > 0.01 {
+    // Calculate dimension line length to check if gap fits
+    dim_line_len := glsl.abs(dim2_2d.y - dim1_2d.y)
+    gap_total_width := text_gap_world
+
+    // Only draw gap if it fits within the dimension line
+    if gap_total_width < dim_line_len - 0.02 {
+        // Gap fits - draw dimension line with gap (split into two segments)
         gap_start_3d := sketch.sketch_to_world(&sk.plane, gap_start_2d)
         append(&dim_lines, [2][3]f32{
             {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
             {f32(gap_start_3d.x), f32(gap_start_3d.y), f32(gap_start_3d.z)},
         })
-    }
 
-    if glsl.abs(dim2_2d.y - gap_end_2d.y) > 0.01 {
         gap_end_3d := sketch.sketch_to_world(&sk.plane, gap_end_2d)
         append(&dim_lines, [2][3]f32{
             {f32(gap_end_3d.x), f32(gap_end_3d.y), f32(gap_end_3d.z)},
+            {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
+        })
+    } else {
+        // Gap too wide - draw full line without gap
+        append(&dim_lines, [2][3]f32{
+            {f32(dim1_3d.x), f32(dim1_3d.y), f32(dim1_3d.z)},
             {f32(dim2_3d.x), f32(dim2_3d.y), f32(dim2_3d.z)},
         })
     }
@@ -2451,10 +2881,13 @@ render_distance_y_dimension_gpu :: proc(
         dim_dir = dim_vec / dim_len
     }
 
-    ARROW_SIZE :: 0.15
+    // Arrow head size - scale with camera distance for consistent screen size
+    camera_distance := glsl.length(viewer.camera.position - viewer.camera.target)
+    ARROW_BASE_SIZE :: 1.5  // Base size in mm
+    arrow_size := ARROW_BASE_SIZE * (camera_distance / 100.0)
     ARROW_ANGLE :: 30.0
 
-    arrow_lines := render_dimension_arrow_heads(sk, dim1_2d, dim2_2d, dim_dir, ARROW_SIZE, ARROW_ANGLE)
+    arrow_lines := render_dimension_arrow_heads(sk, dim1_2d, dim2_2d, dim_dir, arrow_size, ARROW_ANGLE)
     for arrow_line in arrow_lines {
         append(&dim_lines, arrow_line)
     }
@@ -2961,6 +3394,51 @@ viewer_gpu_init :: proc(config: ViewerGPUConfig = DEFAULT_GPU_CONFIG) -> (^Viewe
 
     fmt.println("✓ Triangle pipeline created (for thick lines)")
 
+    // Create wireframe pipeline (same as triangle pipeline but with depth testing enabled)
+    wireframe_pipeline_info := sdl.GPUGraphicsPipelineCreateInfo{
+        vertex_shader = vertex_shader,
+        fragment_shader = fragment_shader,
+        vertex_input_state = vertex_input_state,
+        primitive_type = .TRIANGLELIST,
+        rasterizer_state = {
+            fill_mode = .FILL,
+            cull_mode = .NONE,
+            front_face = .COUNTER_CLOCKWISE,
+        },
+        multisample_state = {
+            sample_count = ._4,
+            sample_mask = 0xFFFFFFFF,
+        },
+        depth_stencil_state = {
+            // Enable depth testing for wireframe overlay - respects geometry occlusion
+            enable_depth_test = true,
+            enable_depth_write = false,  // Don't write to depth buffer (overlay only)
+            compare_op = .LESS_OR_EQUAL,  // Render if depth <= existing (allows co-planar edges)
+            enable_stencil_test = false,
+        },
+        target_info = {
+            num_color_targets = 1,
+            color_target_descriptions = &triangle_color_target,
+            has_depth_stencil_target = true,
+            depth_stencil_format = .D16_UNORM,
+        },
+    }
+
+    wireframe_pipeline := sdl.CreateGPUGraphicsPipeline(gpu_device, wireframe_pipeline_info)
+    if wireframe_pipeline == nil {
+        fmt.eprintln("ERROR: Failed to create wireframe pipeline:", sdl.GetError())
+        sdl.ReleaseGPUGraphicsPipeline(gpu_device, triangle_pipeline)
+        sdl.ReleaseGPUGraphicsPipeline(gpu_device, pipeline)
+        sdl.ReleaseGPUShader(gpu_device, fragment_shader)
+        sdl.ReleaseGPUShader(gpu_device, vertex_shader)
+        sdl.DestroyGPUDevice(gpu_device)
+        sdl.DestroyWindow(window)
+        sdl.Quit()
+        return nil, false
+    }
+
+    fmt.println("✓ Wireframe pipeline created (depth-tested overlay)")
+
     // Create viewer (will be assigned in branches below)
     viewer := new(ViewerGPU)
     viewer.window = window
@@ -2969,6 +3447,7 @@ viewer_gpu_init :: proc(config: ViewerGPUConfig = DEFAULT_GPU_CONFIG) -> (^Viewe
     viewer.fragment_shader = fragment_shader
     viewer.pipeline = pipeline
     viewer.triangle_pipeline = triangle_pipeline
+    viewer.wireframe_pipeline = wireframe_pipeline
 
     // Load triangle shaders for shaded rendering
     triangle_shader_path := "src/ui/viewer/shaders/triangle_shader.metallib"
@@ -3110,8 +3589,8 @@ viewer_gpu_init :: proc(config: ViewerGPUConfig = DEFAULT_GPU_CONFIG) -> (^Viewe
         return nil, false
     }
 
-    // Create grid vertex buffer
-    if !viewer_gpu_create_grid(viewer, 10.0, 20) {
+    // Create grid for ground plane (100mm size for millimeter-scale parts)
+    if !viewer_gpu_create_grid(viewer, 100.0, 20) {
         fmt.eprintln("ERROR: Failed to create grid vertex buffer")
         viewer_gpu_destroy(viewer)
         return nil, false
@@ -3314,6 +3793,10 @@ viewer_gpu_destroy :: proc(viewer: ^ViewerGPU) {
 
     if viewer.triangle_pipeline != nil {
         sdl.ReleaseGPUGraphicsPipeline(viewer.gpu_device, viewer.triangle_pipeline)
+    }
+
+    if viewer.wireframe_pipeline != nil {
+        sdl.ReleaseGPUGraphicsPipeline(viewer.gpu_device, viewer.wireframe_pipeline)
     }
 
     if viewer.pipeline != nil {
@@ -3558,10 +4041,16 @@ viewer_gpu_handle_mouse_button :: proc(viewer: ^ViewerGPU, button: ^sdl.MouseBut
 viewer_gpu_handle_mouse_wheel :: proc(viewer: ^ViewerGPU, wheel: ^sdl.MouseWheelEvent) {
     // Zoom in/out
     zoom_speed := f32(0.1)
-    viewer.camera.distance -= wheel.y * zoom_speed * viewer.camera.distance
 
-    // Clamp distance
-    viewer.camera.distance = glsl.clamp(viewer.camera.distance, 0.5, 100.0)
+    // Update camera distance (for camera positioning)
+    viewer.camera.distance -= wheel.y * zoom_speed * viewer.camera.distance
+    viewer.camera.distance = glsl.clamp(viewer.camera.distance, 0.5, 1000.0)
+
+    // Update orthographic width (for orthographic zoom)
+    if viewer.camera.projection_mode == .Orthographic {
+        viewer.camera.ortho_width -= wheel.y * zoom_speed * viewer.camera.ortho_width
+        viewer.camera.ortho_width = glsl.clamp(viewer.camera.ortho_width, 1.0, 500.0)
+    }
 
     camera_update_position(&viewer.camera)
 }
@@ -3661,7 +4150,13 @@ viewer_gpu_handle_finger :: proc(viewer: ^ViewerGPU, event: ^sdl.Event) {
                 viewer.camera.distance -= distance_delta * zoom_speed * viewer.camera.distance
 
                 // Clamp distance
-                viewer.camera.distance = glsl.clamp(viewer.camera.distance, 0.5, 100.0)
+                viewer.camera.distance = glsl.clamp(viewer.camera.distance, 0.5, 1000.0)
+
+                // Update orthographic width (for orthographic zoom)
+                if viewer.camera.projection_mode == .Orthographic {
+                    viewer.camera.ortho_width -= distance_delta * zoom_speed * viewer.camera.ortho_width
+                    viewer.camera.ortho_width = glsl.clamp(viewer.camera.ortho_width, 1.0, 500.0)
+                }
 
                 camera_update_position(&viewer.camera)
 
@@ -3754,16 +4249,14 @@ viewer_gpu_render_thick_lines :: proc(
     color: [4]f32,
     mvp: matrix[4,4]f32,
     thickness_pixels: f32,
+    use_depth_testing := false,  // NEW: Enable depth testing for 3D wireframe overlay
 ) {
     if len(lines) == 0 {
         return
     }
 
     // Calculate screen-space to world-space conversion
-    // At the camera's distance, calculate how big one pixel is in world units
-    viewport_height := f32(viewer.window_height)
-    fov_radians := math.to_radians(viewer.camera.fov)
-    pixel_size_world := (2.0 * viewer.camera.distance * math.tan(fov_radians * 0.5)) / viewport_height
+    pixel_size_world := get_pixel_size_world(viewer)
 
     // Calculate actual thickness in world units
     thick := pixel_size_world * thickness_pixels * 0.5  // Half-thickness for offset
@@ -3898,8 +4391,14 @@ viewer_gpu_render_thick_lines :: proc(
     // Wait for upload to complete (synchronous for now)
     _ = sdl.WaitForGPUIdle(viewer.gpu_device)
 
-    // Switch to triangle pipeline
-    sdl.BindGPUGraphicsPipeline(pass, viewer.triangle_pipeline)
+    // Choose pipeline based on depth testing requirement
+    pipeline_to_use := viewer.triangle_pipeline  // Default: no depth testing (for UI)
+    if use_depth_testing {
+        pipeline_to_use = viewer.wireframe_pipeline  // Depth-tested for 3D wireframe overlay
+    }
+
+    // Bind selected pipeline
+    sdl.BindGPUGraphicsPipeline(pass, pipeline_to_use)
 
     // Bind thick line vertex buffer
     binding := sdl.GPUBufferBinding{
@@ -3939,8 +4438,8 @@ viewer_gpu_render_wireframe :: proc(
         return
     }
 
-    // Use thick line rendering for all edges
-    viewer_gpu_render_thick_lines(viewer, cmd, pass, mesh.edges[:], color, mvp, thickness_pixels)
+    // Use thick line rendering with depth testing enabled for 3D wireframe overlay
+    viewer_gpu_render_thick_lines(viewer, cmd, pass, mesh.edges[:], color, mvp, thickness_pixels, use_depth_testing = true)
 }
 
 // =============================================================================
@@ -4158,7 +4657,7 @@ viewer_gpu_render_triangle_mesh :: proc(
     // Light direction: from upper-right-front (balanced for CAD viewing)
     // The shader negates this, so this vector points FROM the light source (use negative values!)
     light_dir := [3]f32{-0.4, -0.5, -0.3}  // Gentle angle from upper-right-front
-    ambient_strength: f32 = 0.6            // 60% ambient light + dual directional lights = great visibility
+    ambient_strength: f32 = 0.9            // 90% ambient light for minimal shadows (CAD-friendly)
 
     // Create identity matrix for model transform
     model_matrix := matrix[4,4]f32{
